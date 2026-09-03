@@ -123,4 +123,3 @@ For switching to be efficient at all, both schemes need **compatible ring dimens
 
 ---
 
-*Notes: OpenFHE's exact function names, parameter orders, and internal file locations can shift between releases — always cross-check against the locally cloned source rather than treating this document as a substitute for it.*
