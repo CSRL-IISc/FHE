@@ -60,11 +60,20 @@ Rather than picking one scheme and suffering on the other's operations, **scheme
 
 This is directly the CKKS↔TFHE + RLWE-to-LWE conversion pipeline you're working on for hardware acceleration — OpenFHE's software implementation is effectively the reference algorithm you'd be mapping onto FPGA/hardware datapaths (NTT, base conversion, blind rotation scheduling, etc.).
 
+### 4.1 A note on naming: "FHEW" vs "TFHE" in OpenFHE's switching API
+
+OpenFHE's switching functions are named `EvalCKKStoFHEW` / `EvalFHEWtoCKKS` — but if your work is specifically **CKKS ↔ TFHE**, these are still the functions you use. Here's why:
+
+- **FHEW** and **TFHE** are distinct schemes with different bootstrapping algorithms (FHEW's original **AP** accumulator update vs. TFHE's **GINX/CGGI-style** blind rotation), but both operate on **the same underlying object**: a plain LWE ciphertext `(a, b)` under a binary/ternary secret key.
+- OpenFHE unifies both under one module — `src/binfhe/` — and one context class, `BinFHEContext`, where you select the bootstrapping method as a parameter (`AP` for FHEW-style, `GINX` for TFHE-style) at setup time. Everything downstream — the ciphertext format, key structures, and crucially the **CKKS-switching code** — is agnostic to which method you picked.
+- In other words, `EvalCKKStoFHEW` / `EvalFHEWtoCKKS` don't mean "only compatible with FHEW's bootstrapping." The name reflects the shared LWE/`binfhe` API layer (which was originally built around the FHEW scheme and kept its name), not a restriction to FHEW specifically. **If you configure `BinFHEContext` with `GINX`, you are doing CKKS↔TFHE switching using these exact same functions.**
+- So concretely: the extraction/packing math (`PackLWEs`, field trace, modulus switching) is identical regardless of which bootstrapping style sits on the FHEW/TFHE side — the only thing that changes is what happens *inside* the bootstrap once you're on that side (AP's vs. GINX's blind-rotation accumulator update). For your hardware work, this means the CKKS-side extraction/packing datapath you build is reusable across both, and the only scheme-specific hardware is the blind-rotation core itself.
+
 ---
 
 ## 5. How OpenFHE Implements Scheme Switching
 
-OpenFHE (the merged successor of PALISADE + HElib-style tooling) implements CKKS↔FHEW switching primarily in:
+OpenFHE (the merged successor of PALISADE + HElib-style tooling) implements CKKS↔FHEW/TFHE switching primarily in:
 
 ```
 src/pke/include/scheme/ckksrns/ckksrns-schemeswitching.h
@@ -108,7 +117,9 @@ For switching to be efficient at all, both schemes need **compatible ring dimens
 CryptoContext<DCRTPoly> ccCKKS = ...;
 auto keys = ccCKKS->KeyGen();
 
-// Set up the switching machinery (generates FHEW context + switching keys)
+// Set up the switching machinery (generates the binfhe context + switching keys).
+// Passing BINFHE_METHOD::GINX here is what makes the bootstrapping TFHE-style
+// rather than FHEW-style (AP) — the switching functions themselves don't change.
 auto FHEWparams = ccCKKS->EvalSchemeSwitchingSetup(...);
 auto ccFHEW = FHEWparams.first;
 auto privateKeyFHEW = FHEWparams.second;
