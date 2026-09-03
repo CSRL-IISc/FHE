@@ -14,7 +14,7 @@ Three main scheme families dominate practical FHE today:
 | **CKKS** | Real / complex numbers (approximate) | Deep arithmetic circuits, ML inference, SIMD | Comparisons, exact results, bootstrapping cost |
 | **TFHE / FHEW** | Single bits or small integers | Arbitrary boolean/lookup-table gates, cheap bootstrapping per gate | Very slow for large arithmetic circuits (bit-by-bit) |
 
-Your research (CKKS↔TFHE switching, RLWE-to-LWE conversion) sits exactly at the seam between the second and third rows — which is the point of this document.
+CKKS↔TFHE switching and RLWE-to-LWE conversion sit exactly at the seam between the second and third rows — which is the focus of this document.
 
 ---
 
@@ -26,7 +26,7 @@ CKKS (Cheon–Kim–Kim–Song) encrypts vectors of real/complex numbers and sup
 - Plaintext is encoded into a polynomial in `Z[X]/(X^N + 1)` via a **canonical embedding**, which packs up to `N/2` real (or complex) values into a single ciphertext — enabling SIMD-style batched arithmetic.
 - A ciphertext is a pair `(c0, c1)` in `R_Q^2` (R = ring, Q = ciphertext modulus), and decryption recovers `m + e` for small noise `e` — the result is *approximate*, not exact, by design.
 - **Rescaling**: after a multiplication, the ciphertext modulus is divided down (like floating-point exponent management) to control noise growth and keep the scale consistent. This consumes "levels" — each multiplication uses up one level of the modulus chain `Q = q_0 · q_1 · ... · q_L`.
-- Once you run out of levels, you need **bootstrapping** to refresh the ciphertext back to a high modulus, at high computational cost (this is usually the single most expensive operation in a CKKS pipeline — directly relevant to your bootstrapping work).
+- Once levels run out, **bootstrapping** refreshes the ciphertext back to a high modulus, at high computational cost — this is usually the single most expensive operation in a CKKS pipeline.
 
 CKKS is the workhorse for encrypted machine learning (linear layers, convolutions, polynomial approximations of activation functions) because multiplications and additions are relatively cheap and SIMD packing amortizes cost across thousands of slots.
 
@@ -58,16 +58,16 @@ Real workloads (especially ML inference) need **both** kinds of operations:
 
 Rather than picking one scheme and suffering on the other's operations, **scheme switching** lets you convert ciphertexts back and forth mid-computation: run the linear parts in CKKS, hop over to FHEW/TFHE for the nonlinearity, then hop back to CKKS to continue. This is the "best of both worlds" approach, and it's the feature OpenFHE exposes.
 
-This is directly the CKKS↔TFHE + RLWE-to-LWE conversion pipeline you're working on for hardware acceleration — OpenFHE's software implementation is effectively the reference algorithm you'd be mapping onto FPGA/hardware datapaths (NTT, base conversion, blind rotation scheduling, etc.).
+This CKKS↔TFHE + RLWE-to-LWE conversion pipeline is a natural target for hardware acceleration — OpenFHE's software implementation effectively serves as the reference algorithm for mapping onto FPGA/hardware datapaths (NTT, base conversion, blind rotation scheduling, etc.).
 
 ### 4.1 A note on naming: "FHEW" vs "TFHE" in OpenFHE's switching API
 
-OpenFHE's switching functions are named `EvalCKKStoFHEW` / `EvalFHEWtoCKKS` — but if your work is specifically **CKKS ↔ TFHE**, these are still the functions you use. Here's why:
+OpenFHE's switching functions are named `EvalCKKStoFHEW` / `EvalFHEWtoCKKS` — but for work specifically on **CKKS ↔ TFHE**, these are still the correct functions to use. Here's why:
 
 - **FHEW** and **TFHE** are distinct schemes with different bootstrapping algorithms (FHEW's original **AP** accumulator update vs. TFHE's **GINX/CGGI-style** blind rotation), but both operate on **the same underlying object**: a plain LWE ciphertext `(a, b)` under a binary/ternary secret key.
 - OpenFHE unifies both under one module — `src/binfhe/` — and one context class, `BinFHEContext`, where you select the bootstrapping method as a parameter (`AP` for FHEW-style, `GINX` for TFHE-style) at setup time. Everything downstream — the ciphertext format, key structures, and crucially the **CKKS-switching code** — is agnostic to which method you picked.
-- In other words, `EvalCKKStoFHEW` / `EvalFHEWtoCKKS` don't mean "only compatible with FHEW's bootstrapping." The name reflects the shared LWE/`binfhe` API layer (which was originally built around the FHEW scheme and kept its name), not a restriction to FHEW specifically. **If you configure `BinFHEContext` with `GINX`, you are doing CKKS↔TFHE switching using these exact same functions.**
-- So concretely: the extraction/packing math (`PackLWEs`, field trace, modulus switching) is identical regardless of which bootstrapping style sits on the FHEW/TFHE side — the only thing that changes is what happens *inside* the bootstrap once you're on that side (AP's vs. GINX's blind-rotation accumulator update). For your hardware work, this means the CKKS-side extraction/packing datapath you build is reusable across both, and the only scheme-specific hardware is the blind-rotation core itself.
+- In other words, `EvalCKKStoFHEW` / `EvalFHEWtoCKKS` don't mean "only compatible with FHEW's bootstrapping." The name reflects the shared LWE/`binfhe` API layer (which was originally built around the FHEW scheme and kept its name), not a restriction to FHEW specifically. **Configuring `BinFHEContext` with `GINX` makes the pipeline CKKS↔TFHE switching, using these exact same functions.**
+- So concretely: the extraction/packing math (`PackLWEs`, field trace, modulus switching) is identical regardless of which bootstrapping style sits on the FHEW/TFHE side — the only thing that changes is what happens *inside* the bootstrap once on that side (AP's vs. GINX's blind-rotation accumulator update). For hardware design purposes, this means the CKKS-side extraction/packing datapath is reusable across both, and the only scheme-specific hardware is the blind-rotation core itself.
 
 ---
 
@@ -91,7 +91,7 @@ src/pke/examples/scheme-switching.cpp
 Conceptually, this direction needs to pull **individual real-valued slots** out of a SIMD-packed CKKS ciphertext and re-encrypt each one as a small, single-value LWE ciphertext under FHEW's parameters. Key steps in OpenFHE's pipeline:
 
 1. **`EvalCKKStoFHEWSetup(...)`** — generates the necessary switching keys: a key-switching key from the CKKS RLWE secret to an intermediate representation, and the FHEW bootstrapping/refreshing keys needed on the other side.
-2. **Homomorphic slot extraction**: since CKKS packs many values per ciphertext, the library uses techniques closely related to **`PackLWEs`/`EvalTr` (partial/field trace)** operations to isolate a single slot's contribution — this is exactly the packing/trace math you've been working through.
+2. **Homomorphic slot extraction**: since CKKS packs many values per ciphertext, the library uses techniques closely related to **`PackLWEs`/`EvalTr` (partial/field trace)** operations to isolate a single slot's contribution.
 3. **`EvalCKKStoFHEW(...)`** — performs the actual conversion, producing a vector of LWE ciphertexts (one FHEW ciphertext per extracted CKKS slot), rescaled to FHEW's plaintext modulus.
 4. Internally this relies on a **modulus switch** down to FHEW's much smaller ciphertext modulus, since CKKS operates over a large RNS modulus chain and FHEW/TFHE ciphertexts must stay small for cheap bootstrapping.
 
@@ -108,50 +108,10 @@ The reverse direction takes many small FHEW/LWE ciphertexts (e.g., after evaluat
 For switching to be efficient at all, both schemes need **compatible ring dimensions and moduli** — OpenFHE's setup functions (`EvalSchemeSwitchingSetup`, `EvalCompareSwitchPrecompute`, etc.) negotiate a shared parameter set so that:
 - The RLWE ring used for the CKKS side and the RLWE ring used internally by FHEW's blind rotation (Ring-GSW bootstrapping) can interoperate.
 - Automorphism/Galois keys used for packing are consistent with the CKKS rotation keys already in use.
-- The whole pipeline can target **128-bit security** end-to-end (this is where your parameter-set work on 128-bit security across both schemes matters most — OpenFHE's default FHEW/CKKS combos aren't automatically jointly 128-bit secure unless parameters are chosen carefully).
+- The whole pipeline can target **128-bit security** end-to-end — but OpenFHE's default FHEW/CKKS combinations aren't automatically jointly 128-bit secure; parameters need to be chosen carefully for both schemes together.
 
-### 5.4 Typical usage pattern (example API shape)
 
-```cpp
-// CKKS side setup
-CryptoContext<DCRTPoly> ccCKKS = ...;
-auto keys = ccCKKS->KeyGen();
 
-// Set up the switching machinery (generates the binfhe context + switching keys).
-// Passing BINFHE_METHOD::GINX here is what makes the bootstrapping TFHE-style
-// rather than FHEW-style (AP) — the switching functions themselves don't change.
-auto FHEWparams = ccCKKS->EvalSchemeSwitchingSetup(...);
-auto ccFHEW = FHEWparams.first;
-auto privateKeyFHEW = FHEWparams.second;
-
-ccCKKS->EvalSchemeSwitchingKeyGen(keys, privateKeyFHEW);
-
-// CKKS -> FHEW
-auto ctFHEWvec = ccCKKS->EvalCKKStoFHEW(ctCKKS, numValues);
-
-// ... evaluate a LUT / comparison / sign function per-slot via FHEW bootstrapping ...
-
-// FHEW -> CKKS (pack back up)
-auto ctCKKSresult = ccCKKS->EvalFHEWtoCKKS(ctFHEWvec, numValues, ...);
-```
-
-(Exact signatures vary by OpenFHE version — check `ckksrns-schemeswitching.h` in your installed copy at `/home/yogar/openfhe-development/...` for the precise parameter lists, since these APIs have evolved across releases.)
-
----
-
-## 6. Why This Matters for Hardware Acceleration
-
-The software pipeline above breaks down into hardware-relevant primitives that map directly onto what you're building:
-
-- **NTT / iNTT datapaths** — needed on both the CKKS RLWE side and the FHEW RLWE side (for blind rotation's external products).
-- **Base conversion / RNS operations** — CKKS's rescaling and FHEW's modulus switching both need efficient RNS base conversion hardware.
-- **Automorphism (Galois) evaluation** — required for both `PackLWEs` (FHEW→CKKS) and the trace-based extraction (CKKS→FHEW).
-- **Blind rotation scheduling** — the accumulator-update loop in FHEW bootstrapping, driven by encrypted secret-key bits, is the most latency-critical inner loop and the natural target for a systolic/pipelined FPGA datapath.
-- **Barrett/Montgomery reduction** — underlies essentially every modular multiply in both schemes.
-
-This is essentially the HEAP-paper architecture pattern you've been studying, applied specifically to the switching boundary rather than to CKKS or FHEW in isolation.
-
----
 
 ## 7. Suggested Reading Order
 
@@ -159,9 +119,8 @@ This is essentially the HEAP-paper architecture pattern you've been studying, ap
 2. TFHE original paper — Chillotti et al., *"TFHE: Fast Fully Homomorphic Encryption over the Torus"*
 3. CKKS↔FHEW switching — Lu et al. / Bossuat, Cong, et al., *"Efficiently Switching between Fully Homomorphic Encryption Schemes"* (the paper OpenFHE's implementation is largely based on)
 4. `PackLWEs` / trace-based packing — Micciancio–Polyakov style RLWE packing algorithms
-5. OpenFHE scheme-switching example: `src/pke/examples/scheme-switching.cpp` in your local clone
-6. OpenFHE documentation: https://openfhe-development.readthedocs.io
+5. OpenFHE documentation: https://openfhe-development.readthedocs.io
 
 ---
 
-*Notes: OpenFHE's exact function names, parameter orders, and internal file locations can shift between releases — always cross-check against the version you have cloned at `/home/yogar/openfhe-development` rather than treating this document as a substitute for the source.*
+*Notes: OpenFHE's exact function names, parameter orders, and internal file locations can shift between releases — always cross-check against the locally cloned source rather than treating this document as a substitute for it.*
