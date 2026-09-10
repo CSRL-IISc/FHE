@@ -1,224 +1,222 @@
-# OpenFHE FHEW → CKKS Scheme Switching — Function Call Tree and Code Explanation
+# OpenFHE FHEW → CKKS Scheme Switching
 
-## 1. Scope
+This document explains **the FHEW → CKKS path** in OpenFHE's
+`ckksrns-schemeswitching.cpp`, including the function-call tree,
+important code operations, and their mathematical interpretation.
 
-This document covers ** the FHEW → CKKS direction** in `ckksrns-schemeswitching.cpp`.
-
-The central function is:
+The main runtime function is:
 
 ```cpp
 SWITCHCKKSRNS::EvalFHEWtoCKKS(...)
 ```
 
-The key idea is that OpenFHE does **not decrypt the FHEW/LWE ciphertexts and then encrypt the plaintexts into CKKS**. Instead, it reconstructs the LWE decryption expression homomorphically inside CKKS.
-
-For an LWE ciphertext `(a, b)`:
-
-```text
-b = a · s + Δm + e   (mod q)
-```
-
-so the decryption quantity is:
-
-```text
-b - a · s = Δm + e   (mod q)
-```
-
-OpenFHE represents `a` and `b` as CKKS plaintext data, encrypts the FHEW secret key `s` as a CKKS ciphertext, homomorphically computes `a · s`, and then evaluates the remainder of the LWE-to-CKKS conversion.
-
 ---
 
-# 2. High-Level FHEW → CKKS Tree
+# 1. Big-Picture Function Call Tree
 
 ```text
 EvalFHEWtoCKKS()
 |
-+-- determine number of LWE ciphertexts / CKKS slots
++-- determine numValues / slots / LWE dimension n
 |
-+-- determine FHEW modulus-dependent parameters
-|   |
-|   +-- choose K
-|   +-- choose Chebyshev coefficients
++-- construct matrix A from LWE a-vectors
 |
-+-- Step 1: build A and b from LWE ciphertexts
-|   |
-|   +-- GetA()
-|   +-- GetB()
-|   +-- convert to complex<double>
-|   +-- prescale by 1/(q*K)
++-- construct vector b from LWE b-values
 |
-+-- Step 2: compute A*s homomorphically
++-- compute prescale
+|
++-- EvalPartialHomDecryption()
 |   |
-|   +-- EvalPartialHomDecryption()
+|   +-- pad A columns to power of two
+|   |
+|   +-- EvalLTRectPrecomputeSwitch()
+|   |       |
+|   |       +-- extract shifted diagonals
+|   |       +-- scale diagonals
+|   |       +-- organize diagonals for BSGS
+|   |
+|   +-- EvalLTRectWithPrecomputeSwitch()
+|           |
+|           +-- EvalFastRotationPrecompute()
+|           |
+|           +-- EvalFastRotationExt()
+|           |
+|           +-- KeySwitchExt()
+|           |
+|           +-- EvalMultExt()
+|           |
+|           +-- EvalAddExtInPlace()
+|           |
+|           +-- KeySwitchDownFirstElement()
+|           |
+|           +-- KeySwitchDown()
+|
++-- MakeCKKSPackedPlaintext(b)
+|
++-- EvalNegate(AdotS)
+|
++-- EvalAdd(BPlain, -AdotS)
+|
++-- EvalChebyshevSeries()
 |       |
-|       +-- pad A to power-of-two columns
+|       +-- polynomial approximation of modular reduction
+|
++-- repeated EvalMult / EvalAdd / EvalSub
 |       |
-|       +-- EvalLTRectPrecomputeSwitch()
-|       |       |
-|       |       +-- extract matrix diagonals
-|       |       +-- arrange diagonals for BSGS
-|       |       +-- scale diagonals
-|       |
-|       +-- EvalLTRectWithPrecomputeSwitch()
-|               |
-|               +-- EvalFastRotationPrecompute()
-|               +-- EvalFastRotationExt()
-|               +-- KeySwitchExt()
-|               +-- EvalMultExt()
-|               +-- EvalAddExtInPlace()
-|               +-- giant-step rotations
-|               +-- KeySwitchDown()
+|       +-- sine-based modular-reduction refinement
 |
-+-- Step 3: compute B - A*s
-|   |
-|   +-- MakeCKKSPackedPlaintext(b)
-|   +-- EvalNegate(AdotS)
-|   +-- EvalAdd(BPlain, -AdotS)
++-- post-scale
 |
-+-- Step 4: approximate modular reduction
-|   |
-|   +-- EvalChebyshevSeries()
-|   +-- iterative sine refinement
-|       +-- EvalMult()
-|       +-- EvalAddInPlace()
-|       +-- EvalSubInPlace()
-|
-+-- Step 5: post-scale and post-bias
-|   |
-|   +-- create postScale plaintext
-|   +-- EvalMult()
-|   +-- create postBias plaintext
-|   +-- EvalAddInPlace()
++-- post-bias
 |
 +-- restore sparse encoding if required
 |
-+-- optional ModReduce()
++-- final ModReduce if required
 |
-+v
-CKKS ciphertext containing the converted FHEW result
++-- return CKKS ciphertext
 ```
 
-The actual source explicitly describes the major stages as: forming `A` and `b`, homomorphically computing `A*skLWE`, obtaining `B - A*s`, performing modular reduction with a sine approximation, and applying the final scaling/bias. fileciteturn13file0L32-L62 fileciteturn15file0L10-L57
+A useful conceptual view is:
+
+```text
+FHEW/LWE ciphertexts
+        |
+        v
+extract LWE a-vectors and b-values
+        |
+        v
+form A and b
+        |
+        v
+homomorphically evaluate A * s
+        |
+        v
+construct B - A*s
+        |
+        v
+remove the LWE modulus periodicity
+using a polynomial / sine approximation
+        |
+        v
+post-scale and post-bias
+        |
+        v
+CKKS ciphertext
+```
 
 ---
 
-# 3. What Is Being Converted?
+# 2. Why Is FHEW → CKKS Needed?
 
-Suppose we have several LWE/FHEW ciphertexts:
-
-```text
-c0 = (a0, b0)
-c1 = (a1, b1)
-c2 = (a2, b2)
-...
-```
-
-Each one satisfies approximately:
+An LWE/FHEW ciphertext is of the form:
 
 ```text
-bi = ai · s + Δmi + ei   (mod q)
+(a, b)
 ```
 
-The goal is to produce one CKKS ciphertext containing the messages:
-
-```text
-[m0, m1, m2, ...]
-```
-
-The crucial operation is therefore:
-
-```text
-bi - ai · s
-```
-
-for every input ciphertext.
-
-Because `s` must remain secret, OpenFHE does not compute this in plaintext. It encodes/encrypts the secret key into CKKS and evaluates the dot products homomorphically.
-
----
-
-# 4. `EvalSchemeSwitchingKeyGen()` — Preparing the Key for FHEW → CKKS
-
-Before `EvalFHEWtoCKKS()` can run, a special switching key is generated.
-
-The relevant source first obtains the LWE secret key and rounds its entries to a representation suitable for CKKS. fileciteturn16file0L10-L34
-
-Conceptually:
-
-```text
-LWE secret key s
-      |
-      | convert coefficients
-      v
-CKKS plaintext representation of s
-      |
-      | encrypt with CKKS public key
-      v
-m_FHEWtoCKKSswk
-```
-
-The code does:
-
-```cpp
-uint32_t n_po2 = 1 << static_cast<uint32_t>(std::ceil(std::log2(n)));
-```
-
-so the LWE dimension is padded to the nearest power of two.
-
-Then:
-
-```cpp
-skLWEDouble[i] = std::complex<double>(tmp == neg ? -1.0 : tmp, 0);
-```
-
-This maps the LWE representation into the real-valued CKKS representation. In particular, a coefficient equal to `q-1` is interpreted as `-1`.
-
-The secret key is then encoded as a CKKS packed plaintext and encrypted:
-
-```cpp
-m_FHEWtoCKKSswk = ccCKKS->Encrypt(publicKey, skLWEPlainswk);
-```
-
-The source comment explicitly describes this object as the **CKKS encryption of the FHEW secret key**. fileciteturn16file0L26-L44
-
-This is the central trick that makes homomorphic partial LWE decryption possible.
-
----
-
-# 5. The LWE Equation Being Evaluated
-
-The source eventually wants the CKKS ciphertext corresponding to:
-
-```text
-B - A*s
-```
-
-The mathematical mapping is:
+where the encrypted message is contained in the LWE relation
 
 ```text
 b = a · s + Δm + e   (mod q)
 ```
 
-therefore:
+Therefore:
 
 ```text
 b - a · s = Δm + e   (mod q)
 ```
 
-For multiple LWE ciphertexts, stack their `a` vectors into a matrix:
+The problem is that `s` is secret.
+
+In an ordinary LWE decryption procedure, one would explicitly compute:
+
+```text
+b - a · s
+```
+
+using the secret key.
+
+During scheme switching, we do **not** decrypt the FHEW ciphertext first.
+Instead, OpenFHE moves the computation into CKKS and evaluates the
+decryption expression homomorphically.
+
+The high-level idea is:
+
+```text
+LWE ciphertexts
+     |
+     v
+A and b
+     |
+     v
+homomorphically compute A*s
+     |
+     v
+B - A*s
+     |
+     v
+recover the encoded message values
+     |
+     v
+CKKS ciphertext
+```
+
+This is the essential purpose of `EvalFHEWtoCKKS()`.
+
+---
+
+# 3. The LWE Equation
+
+For each FHEW/LWE ciphertext:
+
+```text
+(a, b)
+```
+
+the LWE relation is:
+
+```text
+b = a · s + Δm + e   (mod q)
+```
+
+where:
+
+```text
+a = LWE ciphertext vector
+s = LWE secret key
+m = plaintext message
+Δ = message scaling factor
+e = LWE error
+q = LWE modulus
+```
+
+Therefore:
+
+```text
+b - a · s = Δm + e   (mod q)
+```
+
+The left-hand side is the LWE decryption expression.
+
+For multiple LWE ciphertexts, OpenFHE collects the `a` vectors into a
+matrix `A` and the `b` values into a vector `b`.
+
+Conceptually:
 
 ```text
 A =
-[ a0
-  a1
-  a2
-  ... ]
-```
+[ a0^T
+  a1^T
+  a2^T
+  ...
+  ak-1^T ]
 
-and stack their `b` values into:
-
-```text
-B = [b0, b1, b2, ...]
+b =
+[ b0
+  b1
+  b2
+  ...
+  bk-1 ]
 ```
 
 Then:
@@ -228,88 +226,177 @@ A*s =
 [ a0 · s
   a1 · s
   a2 · s
+  ...
+  ak-1 · s ]
+```
+
+and therefore:
+
+```text
+b - A*s
+```
+
+contains the corresponding LWE decryption expressions.
+
+---
+
+# 4. What Does `A` Mean Here?
+
+This is an important distinction from the CKKS → FHEW direction.
+
+In `EvalFHEWtoCKKS()`, the code creates:
+
+```cpp
+std::vector<std::vector<std::complex<double>>> A(numValues);
+```
+
+Here `A` really is the matrix formed from the **LWE `a` vectors**.
+
+For each LWE ciphertext:
+
+```cpp
+auto& a = LWECiphertexts[i]->GetA();
+```
+
+and then:
+
+```cpp
+A[i][j] = std::complex<double>(a[j].ConvertToDouble(), 0);
+```
+
+So conceptually:
+
+```text
+LWE ciphertext 0: (a0, b0)
+LWE ciphertext 1: (a1, b1)
+LWE ciphertext 2: (a2, b2)
+...
+
+          |
+          v
+
+A =
+[ a0
+  a1
+  a2
   ... ]
+```
+
+Here `A` is therefore a genuine matrix of LWE coefficients.
+
+This is different from the `A` parameter used by
+`EvalLTWithPrecomputeSwitch()` in the CKKS → FHEW direction, where the
+parameter is a collection of precomputed plaintext diagonals.
+
+In FHEW → CKKS:
+
+```text
+A before linear-transform precomputation
+    = LWE coefficient matrix
+```
+
+After:
+
+```text
+EvalLTRectPrecomputeSwitch(A, ...)
+```
+
+the matrix has effectively been converted into a diagonalized plaintext
+representation suitable for homomorphic matrix multiplication.
+
+---
+
+# 5. `EvalFHEWtoCKKS()`
+
+## Purpose
+
+This is the main FHEW → CKKS scheme-switching function.
+
+The source follows three major conceptual steps before the final modular
+reduction:
+
+```text
+Step 1:
+construct A and b from LWE ciphertexts
+
+Step 2:
+homomorphically compute A*s
+
+Step 3:
+homomorphically compute B - A*s
+```
+
+The code explicitly labels these stages.
+
+The overall mathematical flow is:
+
+```text
+LWE ciphertexts
+        |
+        v
+A, b
+        |
+        v
+A*s
+        |
+        v
+b - A*s
+        |
+        v
+encoded message
+```
+
+---
+
+# 6. `numValues`, `slots`, and `n`
+
+The function first determines how many LWE ciphertexts will be packed into
+the resulting CKKS ciphertext.
+
+Conceptually:
+
+```text
+numValues
+    = number of LWE ciphertexts that will be switched
 ```
 
 and:
 
 ```text
-B - A*s =
-[ b0 - a0 · s
-  b1 - a1 · s
-  b2 - a2 · s
-  ... ]
+slots
+    = number of CKKS slots available for the result
 ```
 
-This is exactly what the source implements in two stages: compute `AdotS`, then compute `B - AdotS`. fileciteturn13file0L42-L62
-
----
-
-# 6. `EvalFHEWtoCKKS()`
-
-Signature:
+The source also obtains:
 
 ```cpp
-Ciphertext<DCRTPoly> SWITCHCKKSRNS::EvalFHEWtoCKKS(
-    std::vector<std::shared_ptr<LWECiphertextImpl>>& LWECiphertexts,
-    uint32_t numCtxts,
-    uint32_t numSlots,
-    uint32_t p,
-    double pmin,
-    double pmax,
-    uint32_t dim1) const
+uint32_t n = LWECiphertexts[0]->GetA().GetLength();
 ```
 
-The function first rejects an empty input vector and determines how many LWE ciphertexts will be packed into the CKKS result. It caps this number by the available CKKS slots. fileciteturn12file4L279-L300
-
-Conceptually:
+Here:
 
 ```text
-input LWE ciphertexts
-        |
-        v
-choose numValues
-        |
-        v
-pack numValues results into CKKS slots
+n = LWE lattice parameter
+  = length of each LWE a-vector
+```
+
+Thus if each LWE ciphertext is:
+
+```text
+(a, b)
+
+a = [a0, a1, ..., an-1]
+```
+
+then:
+
+```text
+n = length(a)
 ```
 
 ---
 
-# 7. Selecting `K` and the Polynomial Approximation
-
-The code selects a parameter `K` based on the LWE dimension:
-
-```cpp
-if (n == 32) {
-    K = 16.0;
-    coefficientsFHEW.assign(g_coefficientsFHEW16);
-}
-else {
-    K = 128.0;
-    if (p <= 4)
-        coefficientsFHEW.assign(g_coefficientsFHEW128_8);
-    else
-        coefficientsFHEW.assign(g_coefficientsFHEW128_9);
-}
-```
-
-The source comments associate `K = 128` with the desired failure probability and distinguish the polynomial used for bit messages from the polynomial used for larger plaintext moduli. fileciteturn13file0L15-L30
-
-The practical purpose is to normalize the value before the homomorphic modular-reduction approximation.
-
----
-
-# 8. Step 1 — Construct `A` and `b`
-
-The source creates:
-
-```cpp
-std::vector<std::vector<std::complex<double>>> A(numValues);
-std::vector<std::complex<double>> b(b_size);
-```
-
-`A[i]` stores the `a` vector of the `i`-th LWE ciphertext. `b[i]` stores its `b` value after prescaling. fileciteturn13file0L32-L49
+# 7. Prescaling
 
 The code computes:
 
@@ -318,221 +405,126 @@ const double prescale =
     (1.0 / LWECiphertexts[0]->GetModulus().ConvertToDouble()) / K;
 ```
 
-Therefore:
-
-```text
-prescale = 1 / (q*K)
-```
-
-where `q` is the LWE modulus.
-
-Then:
-
-```cpp
-A[i][j] = std::complex<double>(a[j].ConvertToDouble(), 0);
-```
-
-and:
-
-```cpp
-b[i] = std::complex<double>(prescale * B_i, 0);
-```
-
-So the source is preparing the numerical data so that the subsequent CKKS computation operates on a normalized representation. fileciteturn15file1L97-L114
-
----
-
-# 9. Why Is `A` a Matrix Here?
-
-This `A` is different from the `A` used in the earlier CKKS → FHEW discussion.
-
-Here:
-
-```text
-A[i][j] = a_j of the i-th LWE ciphertext
-```
-
-Therefore, if there are `r` LWE ciphertexts and LWE dimension `n`:
-
-```text
-A has approximately r rows × n columns
-```
-
-For example, with three LWE ciphertexts:
-
-```text
-A =
-[ a00 a01 a02 a03
-  a10 a11 a12 a13
-  a20 a21 a22 a23 ]
-```
-
-Then:
-
-```text
-A · s =
-[ a00*s0 + a01*s1 + a02*s2 + a03*s3
-  a10*s0 + a11*s1 + a12*s2 + a13*s3
-  a20*s0 + a21*s1 + a22*s2 + a23*s3 ]
-```
-
-That vector is exactly the collection of inner products required by LWE decryption.
-
----
-
-# 10. Step 2 — `EvalPartialHomDecryption()`
-
-The source calls:
-
-```cpp
-auto AdotS = EvalPartialHomDecryption(
-    *ccCKKS, A, m_FHEWtoCKKSswk, dim1, prescale, 0);
-```
-
-The source comment is explicit:
-
-```text
-Step 2. Perform the homomorphic linear transformation of A*skLWE
-```
-
-This is the heart of the FHEW → CKKS scheme switch. fileciteturn13file0L51-L54
-
-Conceptually:
-
-```text
-A
- |
- | plaintext matrix
- v
-A*s
- |
- | evaluated homomorphically in CKKS
- v
-AdotS ciphertext
-```
-
-The switching key `m_FHEWtoCKKSswk` supplies the encrypted secret key `s`.
-
----
-
-# 11. `EvalPartialHomDecryption()` — Why Padding Is Needed
-
-The function first copies `A` and computes the next power of two for its number of columns:
-
-```cpp
-size_t cols_po2 =
-    1 << static_cast<uint32_t>(std::ceil(std::log2(A[0].size())));
-```
-
-If necessary, each row is resized to that power-of-two length. fileciteturn11file0L30-L45
-
-Conceptually:
-
-```text
-original LWE dimension n
-        |
-        v
-next power of two
-        |
-        v
-pad each a vector with zeros
-```
-
-This is required because the rectangular linear-transform machinery is designed around power-of-two dimensions.
-
-The function then calls:
-
-```cpp
-auto Apre = EvalLTRectPrecomputeSwitch(Acopy, dim1, scale);
-```
-
-followed by:
-
-```cpp
-return EvalLTRectWithPrecomputeSwitch(
-    cc, Apre, ct,
-    (Acopy.size() < A[0].size()), dim1, L);
-```
-
-The source comment states that the result is repeated every `Acopy.size()` slots. fileciteturn11file0L34-L45
-
-Thus:
-
-```text
-EvalPartialHomDecryption()
-    = prepare A for the rectangular linear transform
-      and evaluate A*s homomorphically
-```
-
----
-
-# 12. `EvalLTRectPrecomputeSwitch()`
-
-This function prepares the rectangular matrix for the linear-transform engine.
-
-For power-of-two matrix dimensions it computes:
-
-```cpp
-const uint32_t n = std::min(A.size(), A[0].size());
-```
-
-and creates a vector of diagonal representations:
-
-```cpp
-std::vector<std::vector<std::complex<double>>> diags(n);
-```
-
-For the case where the matrix has at least as many rows as columns, it computes BSGS parameters:
-
-```cpp
-bStep = ...
-gStep = ceil(n / bStep)
-```
-
-and then extracts the shifted diagonals with:
-
-```cpp
-ExtractShiftedDiagonal(A_slices[k], bStep * j + i)
-```
-
-The extracted diagonal is multiplied by `scale` and stored in `diags[...]`. fileciteturn13file5L369-L404
-
 So conceptually:
 
 ```text
-matrix A
-  |
-  +-- shifted diagonal D0
-  +-- shifted diagonal D1
-  +-- shifted diagonal D2
-  +-- ...
-  |
-  v
-precomputed diagonal representation
+prescale = 1 / (q * K)
 ```
 
-This is the same diagonal linear-transform technique used by CKKS matrix-vector multiplication.
+where:
+
+```text
+q = LWE modulus
+K = scaling factor used by the modular-reduction approximation
+```
+
+The purpose is to put the LWE decryption quantity into the numerical range
+expected by the CKKS polynomial approximation used later.
+
+Conceptually:
+
+```text
+b - A*s
+      |
+      v
+divide by q
+      |
+      v
+normalized value
+      |
+      v
+divide by K
+      |
+      v
+range suitable for polynomial approximation
+```
+
+The source uses different `K` values depending on the LWE dimension.
 
 ---
 
-# 13. Why Does the Linear Transform Compute `A*s`?
+# 8. Step 1: Form Matrix `A` and Vector `b`
 
-Suppose:
+The code creates:
+
+```cpp
+std::vector<std::vector<std::complex<double>>> A(numValues);
+std::vector<std::complex<double>> b(b_size);
+```
+
+Then, for every LWE ciphertext:
+
+```cpp
+auto& a = LWECiphertexts[i]->GetA();
+A[i].resize(a.GetLength());
+
+for (uint32_t j = 0; j < a.GetLength(); ++j)
+    A[i][j] =
+        std::complex<double>(a[j].ConvertToDouble(), 0);
+
+b[i] =
+    std::complex<double>(
+        prescale * LWECiphertexts[i]->GetB().ConvertToDouble(),
+        0);
+```
+
+Conceptually:
+
+```text
+LWE ciphertext i:
+
+(ai, bi)
+
+        |
+        +----> A[i] = ai
+        |
+        +----> b[i] = prescale * bi
+```
+
+After all LWE ciphertexts are processed:
+
+```text
+A =
+[ a0^T
+  a1^T
+  ...
+  a(numValues-1)^T ]
+
+b =
+[ prescale*b0
+  prescale*b1
+  ...
+  prescale*b(numValues-1) ]
+```
+
+---
+
+# 9. Why Is `A*s` a Linear Transform?
+
+The product:
+
+```text
+A*s
+```
+
+has one output per LWE ciphertext.
+
+For example:
 
 ```text
 A =
 [ a00 a01 a02 a03
   a10 a11 a12 a13
   a20 a21 a22 a23 ]
+
+s =
+[ s0
+  s1
+  s2
+  s3 ]
 ```
 
-and the encrypted secret key is:
-
-```text
-s = [s0, s1, s2, s3]
-```
-
-Then the desired result is:
+Then:
 
 ```text
 A*s =
@@ -541,197 +533,312 @@ A*s =
   a20*s0 + a21*s1 + a22*s2 + a23*s3 ]
 ```
 
-The diagonal method rewrites the same computation as a sequence of:
+The secret key `s` is encoded/encrypted in the CKKS-side switching key.
+
+Therefore the computation becomes:
 
 ```text
-rotate s
-multiply by a plaintext diagonal of A
-add the results
+encrypted secret-key representation
+                |
+                v
+homomorphic matrix-vector multiplication
+                |
+                v
+                  A*s
 ```
 
-Conceptually:
-
-```text
-A*s
-  = D0 ⊙ Rot0(s)
-  + D1 ⊙ Rot1(s)
-  + D2 ⊙ Rot2(s)
-  + ...
-```
-
-Here the `Dk` values come from `ExtractShiftedDiagonal()`.
-
-The important difference from ordinary matrix multiplication is that `s` is not available as plaintext. In OpenFHE, `s` is already encrypted by `m_FHEWtoCKKSswk`, so all of these operations are performed homomorphically.
+This is why `EvalPartialHomDecryption()` uses the same diagonalized
+linear-transform machinery discussed in the FHE Textbook's matrix
+multiplication formulation.
 
 ---
 
-# 14. `EvalLTRectWithPrecomputeSwitch()`
+# 10. `EvalPartialHomDecryption()`
 
-This function actually evaluates the precomputed linear transform.
-
-It first determines the BSGS parameters:
-
-```cpp
-uint32_t bStep = (dim1 == 0) ? getRatioBSGSLT(n) : dim1;
-uint32_t gStep = std::ceil(static_cast<double>(n) / bStep);
-```
-
-Then it computes the hoisted-rotation preparation:
-
-```cpp
-auto digits = cc.EvalFastRotationPrecompute(ct);
-```
-
-and creates:
-
-```cpp
-std::vector<Ciphertext<DCRTPoly>> fastRotation(bStep - 1);
-```
-
-The source then generates the baby-step rotations:
-
-```cpp
-for (uint32_t j = 1; j < bStep; ++j)
-    fastRotation[j - 1] = cc.EvalFastRotationExt(ct, j, digits, true);
-```
-
-This is the concrete implementation of the repeated rotations required by the diagonal linear transform. fileciteturn14file0L15-L30 fileciteturn14file0L69-L72
-
----
-
-# 15. `EvalFastRotationPrecompute()`
-
-The source says:
-
-```cpp
-auto digits = cc.EvalFastRotationPrecompute(ct);
-```
-
-Conceptually this prepares common NTT-related information for several subsequent automorphisms/rotations.
-
-It is an optimization rather than an additional mathematical term.
-
-Think:
+This function is the bridge between:
 
 ```text
-one expensive common preparation
-          |
-          +--> Rot1(s)
-          +--> Rot2(s)
-          +--> Rot3(s)
-          +--> ...
-```
-
-The source comment identifies this as computing the NTTs used for hoisted automorphisms. fileciteturn14file0L27-L30
-
----
-
-# 16. `EvalFastRotationExt()`
-
-The source creates the baby-step rotations with:
-
-```cpp
-cc.EvalFastRotationExt(ct, j, digits, true)
-```
-
-Conceptually:
-
-```text
-EvalFastRotationExt(ct, j, ...)
-              |
-              v
-           Rot_j(ct)
-```
-
-In this FHEW → CKKS path, `ct` contains the encrypted representation of the FHEW secret key.
-
-Therefore these rotations are effectively rotations of encrypted `s`.
-
----
-
-# 17. `KeySwitchExt()`
-
-The core accumulation begins with:
-
-```cpp
-auto inner = FHECKKSRNS::EvalMultExt(
-    cc.KeySwitchExt(ctxt, true),
-    A[bStep * j]);
-```
-
-The `KeySwitchExt()` call prepares the ciphertext representation needed by the extended-RNS multiplication path.
-
-It is not a separate mathematical term in `A*s`.
-
-The mathematical operation is still:
-
-```text
-Dk ⊙ Rotk(s)
-```
-
----
-
-# 18. `EvalMultExt()`
-
-The source computes terms such as:
-
-```cpp
-FHECKKSRNS::EvalMultExt(
-    fastRotation[i - 1],
-    A[bStep * j + i])
-```
-
-Conceptually this is:
-
-```text
-Dk ⊙ Rotk(s)
-```
-
-where:
-
-```text
-Dk = corresponding plaintext diagonal of A
+LWE coefficient matrix A
 ```
 
 and:
 
 ```text
-Rotk(s) = rotated encrypted secret key
+homomorphic CKKS computation of A*s
 ```
 
-This is the homomorphic matrix-vector multiplication term.
-
----
-
-# 19. `EvalAddExtInPlace()`
-
-The code accumulates the diagonal products using:
+The source first makes a copy:
 
 ```cpp
-FHECKKSRNS::EvalAddExtInPlace(
-    inner,
-    FHECKKSRNS::EvalMultExt(...))
+auto Acopy = A;
+```
+
+Then computes:
+
+```cpp
+size_t cols_po2 =
+    1 << static_cast<uint32_t>(
+        std::ceil(std::log2(A[0].size()))
+    );
+```
+
+This finds the next power of two at least as large as the number of
+columns.
+
+If necessary, every row is padded:
+
+```cpp
+Acopy[i].resize(cols_po2);
 ```
 
 Conceptually:
 
 ```text
-inner = inner + Dk ⊙ Rotk(s)
+original A:
+
+[a00 a01 a02 a03 a04]
+
+        |
+        v
+
+power-of-two padding
+
+[a00 a01 a02 a03 a04 0 0 0]
 ```
-
-After all relevant terms are included:
-
-```text
-inner ≈ A*s
-```
-
-The OpenFHE source performs exactly this baby-step accumulation inside the giant-step loop. fileciteturn14file1L92-L115
 
 ---
 
-# 20. BSGS: Why `A[bStep*j+i]` Appears
+# 11. Why Is `A` Padded to a Power of Two?
 
-The linear transform is organized using:
+The CKKS linear-transform implementation is designed around power-of-two
+dimensions and rotation structures.
+
+The function comment explicitly states that the LWE lattice parameter is
+padded to a power of two.
+
+Conceptually:
+
+```text
+LWE dimension n
+      |
+      v
+next power of two
+      |
+      v
+matrix dimension accepted by the linear-transform routine
+```
+
+This makes the rotation/BSGS decomposition regular.
+
+---
+
+# 12. `EvalLTRectPrecomputeSwitch()`
+
+The source then calls:
+
+```cpp
+auto Apre =
+    EvalLTRectPrecomputeSwitch(Acopy, dim1, scale);
+```
+
+This converts the matrix into the diagonalized representation used by the
+homomorphic linear-transform evaluator.
+
+Conceptually:
+
+```text
+LWE matrix A
+      |
+      v
+extract shifted diagonals
+      |
+      v
+scale diagonals
+      |
+      v
+organize for BSGS
+      |
+      v
+Apre
+```
+
+The important difference from the square version is that this function is
+specifically designed for the rectangular matrix that occurs here.
+
+---
+
+# 13. `EvalLTRectPrecomputeSwitch()`: Diagonal Extraction
+
+For the relevant branch, the source does conceptually:
+
+```cpp
+auto tmp =
+    ExtractShiftedDiagonal(A_slices[k], bStep*j + i);
+```
+
+Then:
+
+```cpp
+diag.insert(diag.end(), tmp.begin(), tmp.end());
+```
+
+and scales:
+
+```cpp
+elem * scale
+```
+
+So the process is:
+
+```text
+A matrix
+ |
+ +-- shifted diagonal 0 -> D0
+ |
+ +-- shifted diagonal 1 -> D1
+ |
+ +-- shifted diagonal 2 -> D2
+ |
+ +-- ...
+ |
+ v
+diags[]
+```
+
+These diagonal vectors are the matrix-multiplication representation used by
+the CKKS linear-transform engine.
+
+---
+
+# 14. Mathematical Form of the Linear Transform
+
+For a matrix-vector multiplication:
+
+```text
+y = A*s
+```
+
+the diagonal decomposition is conceptually:
+
+```text
+y = D0 ⊙ Rot0(s)
+  + D1 ⊙ Rot1(s)
+  + D2 ⊙ Rot2(s)
+  + ...
+```
+
+where:
+
+```text
+Dk
+    = a cyclic/shifted diagonal of A
+
+Rotk(s)
+    = rotation of the CKKS-packed secret-key vector
+
+⊙
+    = slot-wise multiplication
+```
+
+The exact sign/direction of the rotation and the corresponding shifted
+diagonal follows the convention implemented by OpenFHE's
+`ExtractShiftedDiagonal()` and rotation helpers.
+
+---
+
+# 15. `m_FHEWtoCKKSswk`
+
+A crucial object is:
+
+```text
+m_FHEWtoCKKSswk
+```
+
+This is a CKKS ciphertext containing an encoding of the FHEW/LWE secret
+key.
+
+The setup code constructs the LWE secret-key vector, maps the LWE
+representation into floating-point CKKS values, and encrypts it under the
+CKKS public key.
+
+Conceptually:
+
+```text
+LWE secret key s
+      |
+      v
+encode s as CKKS plaintext
+      |
+      v
+CKKS Encrypt(pk, s)
+      |
+      v
+m_FHEWtoCKKSswk
+```
+
+This is the key reason the FHEW → CKKS direction can evaluate LWE
+decryption without possessing the plaintext secret key during evaluation.
+
+---
+
+# 16. `EvalLTRectWithPrecomputeSwitch()`
+
+This function actually evaluates:
+
+```text
+A*s
+```
+
+using the precomputed diagonals.
+
+Its inputs are conceptually:
+
+```text
+Apre  = diagonalized representation of A
+ct    = CKKS ciphertext containing the encoded/encrypted LWE secret key
+```
+
+Its output is:
+
+```text
+encrypted A*s
+```
+
+The call from `EvalPartialHomDecryption()` is:
+
+```cpp
+return EvalLTRectWithPrecomputeSwitch(
+    cc,
+    Apre,
+    ct,
+    (Acopy.size() < A[0].size()),
+    dim1,
+    L
+);
+```
+
+---
+
+# 17. BSGS in `EvalLTRectWithPrecomputeSwitch()`
+
+The function calculates:
+
+```cpp
+uint32_t bStep =
+    (dim1 == 0) ? getRatioBSGSLT(n) : dim1;
+
+uint32_t gStep =
+    std::ceil(static_cast<double>(n) / bStep);
+```
+
+where:
+
+```text
+bStep = baby-step size
+gStep = number of giant steps
+```
+
+The diagonal index is conceptually decomposed as:
 
 ```text
 k = j*bStep + i
@@ -744,79 +851,34 @@ j = giant-step index
 i = baby-step index
 ```
 
-Therefore the source uses:
-
-```cpp
-A[bStep * j + i]
-```
-
-which identifies the diagonal associated with rotation index `k`.
-
-The important conceptual expression is:
-
-```text
-A*s
-  = Σk Dk ⊙ Rotk(s)
-```
-
-while the implementation groups those terms into BSGS blocks.
+This is the same BSGS strategy used by the CKKS linear-transform machinery.
 
 ---
 
-# 21. Giant-Step Handling
+# 18. `EvalFastRotationPrecompute()`
 
-After forming the baby-step sum for a giant step, the source performs:
-
-```cpp
-inner = cc.KeySwitchDown(inner);
-```
-
-then determines the automorphism corresponding to the giant-step rotation:
+The function computes:
 
 ```cpp
-uint32_t autoIndex =
-    FindAutomorphismIndex2nComplex(bStep * j, M);
+auto digits = cc.EvalFastRotationPrecompute(ct);
 ```
 
-and prepares the corresponding automorphism map:
-
-```cpp
-PrecomputeAutoMap(N, autoIndex, &map);
-```
-
-The source then transforms the first element and applies a fast rotation for the giant-step amount. fileciteturn14file1L99-L115
+The comment explains that this computes the NTT representation needed for
+the hoisted automorphisms used later.
 
 Conceptually:
 
 ```text
-baby-step products
-       |
-       v
-sum for this block
-       |
-       v
-giant-step rotation
-       |
-       v
-add to overall result
+encrypted secret-key vector
+        |
+        v
+precompute common rotation information
+        |
+        v
+digits
 ```
 
-Thus BSGS reduces the cost of evaluating the complete diagonal sum.
-
----
-
-# 22. `KeySwitchDown()`
-
-The source finishes the linear-transform accumulation with:
-
-```cpp
-result = cc.KeySwitchDown(result);
-result->GetElements()[0] += first;
-```
-
-This returns the extended-RNS result to the ordinary representation and restores the part accumulated separately in `first`. fileciteturn14file1L113-L120
-
-This is implementation machinery around the linear transform; mathematically the output is still the ciphertext of:
+This is an optimization and does not change the mathematical operation:
 
 ```text
 A*s
@@ -824,53 +886,338 @@ A*s
 
 ---
 
-# 23. Return to `EvalFHEWtoCKKS()` — Build `BPlain`
+# 19. `EvalFastRotationExt()`
 
-Once `AdotS` has been generated, the source encodes the vector `b` as a CKKS plaintext:
+The function prepares baby-step rotations:
 
 ```cpp
-Plaintext BPlain = ccCKKS->MakeCKKSPackedPlaintext(
-    b,
-    AdotS->GetNoiseScaleDeg(),
-    AdotS->GetLevel(),
-    nullptr,
-    N / 2);
+fastRotation[j - 1] =
+    cc.EvalFastRotationExt(
+        ct,
+        j,
+        digits,
+        true
+    );
 ```
 
-This is important because `b` is not encrypted yet. It is known data extracted from the LWE ciphertexts.
-
-So now:
+Conceptually:
 
 ```text
-BPlain = plaintext containing prescaled b values
-AdotS = ciphertext containing prescaled A*s values
+ct = encrypted s
+
+EvalFastRotationExt(ct, j, ...)
+            |
+            v
+        Rotj(s)
+```
+
+So the mathematical mapping is:
+
+```text
+FHE Textbook / linear transform      OpenFHE
+------------------------------------------------
+Rotj(s)                              EvalFastRotationExt(...)
 ```
 
 ---
 
-# 24. Computing `B - A*s`
+# 20. `KeySwitchExt()`
 
-The source does:
+The first giant-step computation contains:
 
 ```cpp
-auto BminusAdotS = ccCKKS->EvalAdd(
-    ccCKKS->EvalNegate(AdotS),
-    BPlain);
+cc.KeySwitchExt(ctxt, true)
+```
+
+This is not another matrix term.
+
+It is part of the extended-RNS ciphertext machinery used by
+`EvalMultExt()`.
+
+Conceptually:
+
+```text
+CKKS ciphertext
+      |
+      v
+extended representation
+      |
+      v
+extended plaintext multiplication
+```
+
+The mathematical operation remains:
+
+```text
+Dk ⊙ Rotk(s)
+```
+
+---
+
+# 21. `EvalMultExt()`
+
+The core operation is:
+
+```cpp
+auto inner =
+    FHECKKSRNS::EvalMultExt(
+        cc.KeySwitchExt(ctxt, true),
+        A[bStep * j]
+    );
+```
+
+For baby-step terms:
+
+```cpp
+FHECKKSRNS::EvalAddExtInPlace(
+    inner,
+    FHECKKSRNS::EvalMultExt(
+        fastRotation[i - 1],
+        A[bStep * j + i]
+    )
+);
+```
+
+Conceptually:
+
+```text
+A[k]
+   |
+   v
+Dk
+
+fastRotation[i-1]
+   |
+   v
+Rotk(s)
+
+EvalMultExt(...)
+   |
+   v
+Dk ⊙ Rotk(s)
+```
+
+---
+
+# 22. `EvalAddExtInPlace()`
+
+The individual diagonal contributions are accumulated:
+
+```cpp
+EvalAddExtInPlace(
+    inner,
+    EvalMultExt(...)
+);
+```
+
+Conceptually:
+
+```text
+inner =
+    inner + Dk ⊙ Rotk(s)
+```
+
+After all terms:
+
+```text
+A*s =
+D0 ⊙ Rot0(s)
++ D1 ⊙ Rot1(s)
++ D2 ⊙ Rot2(s)
++ ...
+```
+
+Therefore:
+
+```text
+EvalLTRectWithPrecomputeSwitch()
+    =
+evaluate A*s homomorphically
+```
+
+---
+
+# 23. Giant-Step Rotation
+
+After the inner baby-step sum has been formed, the code handles the giant
+step.
+
+It identifies the automorphism associated with:
+
+```cpp
+bStep * j
+```
+
+using:
+
+```cpp
+FindAutomorphismIndex2nComplex(
+    bStep * j,
+    M
+)
+```
+
+Then it evaluates:
+
+```cpp
+cc.EvalFastRotationExt(
+    inner,
+    bStep * j,
+    innerDigits,
+    false
+)
+```
+
+Conceptually:
+
+```text
+baby-step accumulation
+        |
+        v
+rotate by the giant-step amount
+        |
+        v
+giant-step contribution
+```
+
+This is how the BSGS decomposition reconstructs the full set of required
+rotations.
+
+---
+
+# 24. `KeySwitchDownFirstElement()` and `KeySwitchDown()`
+
+The implementation separates one polynomial component:
+
+```cpp
+first =
+    cc.KeySwitchDownFirstElement(inner);
+```
+
+and later uses:
+
+```cpp
+inner =
+    cc.KeySwitchDown(inner);
+```
+
+and finally:
+
+```cpp
+result =
+    cc.KeySwitchDown(result);
+```
+
+Conceptually:
+
+```text
+extended-RNS intermediate result
+        |
+        +-- KeySwitchDownFirstElement()
+        |
+        +-- KeySwitchDown()
+        |
+        v
+normal CKKS representation
+```
+
+These are implementation-level operations required by the extended
+ciphertext machinery.
+
+They are not additional terms in:
+
+```text
+A*s
+```
+
+---
+
+# 25. Result of `EvalPartialHomDecryption()`
+
+After:
+
+```cpp
+EvalLTRectWithPrecomputeSwitch(...)
+```
+
+the result is approximately:
+
+```text
+AdotS = A*s
+```
+
+but evaluated **homomorphically in CKKS**.
+
+This is the critical conceptual transition:
+
+```text
+LWE secret key s
+      |
+      | encrypted under CKKS
+      v
+CKKS ciphertext of s
+      |
+      | linear transform A
+      v
+CKKS ciphertext of A*s
+```
+
+No LWE plaintext is decrypted during this process.
+
+---
+
+# 26. Step 3: Construct `BPlain`
+
+After `AdotS` has been computed, the code constructs:
+
+```cpp
+Plaintext BPlain =
+    ccCKKS->MakeCKKSPackedPlaintext(
+        b,
+        AdotS->GetNoiseScaleDeg(),
+        AdotS->GetLevel(),
+        nullptr,
+        N / 2
+    );
+```
+
+Conceptually:
+
+```text
+b vector
+  |
+  v
+CKKS plaintext
+  |
+  v
+BPlain
+```
+
+The important point is that `BPlain` is **not encrypted**.
+
+The LWE `b` values are ciphertext components, not the plaintext messages.
+Once the `b` values have been extracted from the LWE ciphertexts, they can
+be inserted into a CKKS plaintext.
+
+---
+
+# 27. Compute `B - A*s`
+
+The source performs:
+
+```cpp
+auto BminusAdotS =
+    ccCKKS->EvalAdd(
+        ccCKKS->EvalNegate(AdotS),
+        BPlain
+    );
 ```
 
 Mathematically:
 
 ```text
-BminusAdotS = B - AdotS
+BminusAdotS = B - A*s
 ```
-
-which corresponds to:
-
-```text
-b - a · s
-```
-
-for each LWE ciphertext.
 
 Using the LWE equation:
 
@@ -878,228 +1225,339 @@ Using the LWE equation:
 b = a · s + Δm + e   (mod q)
 ```
 
-we therefore get:
+we obtain:
 
 ```text
 b - a · s = Δm + e   (mod q)
 ```
 
-This is the central correctness equation for the FHEW → CKKS switch.
-
-The source explicitly labels this as **Step 3: Get the ciphertext of B - A*s**. fileciteturn13file0L56-L62
-
----
-
-# 25. Why Isn't `B - A*s` Already the Final CKKS Plaintext?
-
-It is not yet in the desired CKKS representation.
-
-The value is still a quantity represented modulo the LWE modulus and normalized by the earlier scaling.
-
-The source therefore performs a homomorphic modular-reduction/approximation stage before applying the final output scaling.
-
-The source calls this:
+For all ciphertexts together:
 
 ```text
-Step 4. Do the modulus reduction: homomorphically evaluate modular function.
+B - A*s
+    =
+[ Δm0 + e0
+  Δm1 + e1
+  ...
+]
 ```
 
-and implements it using a sine approximation through a Chebyshev polynomial followed by iterative refinement. fileciteturn13file0L56-L62 fileciteturn14file3L216-L234
+up to the normalization/scaling introduced by `prescale`.
+
+This is the central mathematical step of the FHEW → CKKS switch.
 
 ---
 
-# 26. `EvalChebyshevSeries()`
+# 28. Why Is Another Step Needed After `B - A*s`?
 
-The source performs:
+The quantity:
 
-```cpp
-auto BminusAdotS3 = ccCKKS->EvalChebyshevSeries(
-    BminusAdotS,
-    coefficientsFHEW,
-    -1.0,
-    1.0);
+```text
+B - A*s
 ```
 
-The earlier `prescale` included the factor `1/K`, so the input is normalized before this approximation.
+is still fundamentally an LWE-modulus quantity.
 
-The polynomial coefficients selected earlier approximate the required sine-based modular operation.
+The LWE modulus is periodic:
+
+```text
+value mod q
+```
+
+while CKKS operates over approximate real/complex values.
+
+OpenFHE therefore applies a polynomial approximation to recover a
+representative of the desired message from the modular quantity.
 
 Conceptually:
 
 ```text
 B - A*s
-     |
-     | normalized
-     v
-approximately wrapped/modular value
+      |
+      v
+normalize
+      |
+      v
+approximate modular reduction
+      |
+      v
+message-related value
 ```
-
-This is not ordinary plaintext arithmetic. `EvalChebyshevSeries()` evaluates the polynomial **homomorphically** on the ciphertext.
 
 ---
 
-# 27. Iterative Sine Refinement
+# 29. `EvalChebyshevSeries()`
 
-After the Chebyshev approximation, the code executes three iterations:
+The code uses:
+
+```cpp
+auto BminusAdotS3 =
+    ccCKKS->EvalChebyshevSeries(
+        BminusAdotS,
+        coefficientsFHEW,
+        -1.0,
+        1.0
+    );
+```
+
+The coefficient array is chosen according to the LWE parameter and desired
+precision.
+
+Conceptually:
+
+```text
+x = normalized (B - A*s)
+
+        |
+        v
+
+Chebyshev polynomial P(x)
+
+        |
+        v
+
+approximation to the required periodic/modular function
+```
+
+So:
+
+```text
+EvalChebyshevSeries()
+    =
+evaluate an encrypted polynomial approximation
+```
+
+This is performed entirely homomorphically in CKKS.
+
+---
+
+# 30. Why Use a Sine-Based Function?
+
+The source comment describes the modular-reduction stage as:
+
+```text
+homomorphically evaluate modular function
+using sine approximation
+```
+
+The coefficient tables correspond to approximations of a periodic function
+related to:
+
+```text
+sin(2*pi*x)
+```
+
+The purpose is to map values that differ by multiples of the LWE modulus
+back toward the representative corresponding to the desired plaintext.
+
+Conceptually:
+
+```text
+q-periodic LWE value
+        |
+        v
+normalized periodic value
+        |
+        v
+approximate periodic function
+        |
+        v
+recover a bounded representative
+```
+
+---
+
+# 31. Repeated Squaring / Sine-Refinement Loop
+
+The source then executes:
 
 ```cpp
 const int32_t BT_ITER = 3;
+
 for (int32_t j = 1; j <= BT_ITER; ++j) {
-    BminusAdotS3 = ccCKKS->EvalMult(
-        BminusAdotS3,
-        BminusAdotS3);
+    BminusAdotS3 =
+        ccCKKS->EvalMult(
+            BminusAdotS3,
+            BminusAdotS3
+        );
 
     ccCKKS->EvalAddInPlace(
         BminusAdotS3,
-        BminusAdotS3);
+        BminusAdotS3
+    );
 
-    double scalar = 1.0 / std::pow(
-        (2.0 * M_PI),
-        std::pow(2.0, j - BT_ITER));
+    double scalar =
+        1.0 /
+        std::pow(
+            (2.0 * M_PI),
+            std::pow(2.0, j - BT_ITER)
+        );
 
-    ccCKKS->EvalSubInPlace(BminusAdotS3, scalar);
+    ccCKKS->EvalSubInPlace(
+        BminusAdotS3,
+        scalar
+    );
 }
 ```
 
-Mathematically, if the current approximation is `x`, the update is of the form:
+The conceptual recurrence is:
 
 ```text
-x -> 2*x^2 - scalar
+x(j) -> 2*x(j)^2 - c(j)
 ```
 
-with the scalar chosen according to the iteration.
+with a stage-dependent constant:
 
-This is the repeated nonlinear refinement used by the implementation to obtain the desired periodic/modular behavior.
+```text
+c(j) =
+1 / (2*pi)^(2^(j-BT_ITER))
+```
 
-The source comments explicitly identify this stage as part of the sine approximation. fileciteturn14file3L224-L234
+The purpose is to repeatedly refine the approximation to the desired
+periodic/modular transformation.
+
+So the code is not simply "doing another matrix multiplication." This
+section is the **modular-reduction / message-recovery stage**.
 
 ---
 
-# 28. Why Use a Polynomial at All?
+# 32. Why Does `K` Appear?
 
-The CKKS evaluator can evaluate additions and multiplications, but it cannot directly execute an arbitrary operation such as:
-
-```text
-x mod q
-```
-
-as a native operation on encrypted data.
-
-Therefore OpenFHE approximates the needed periodic function with a polynomial. Polynomial evaluation can be implemented with homomorphic additions and multiplications.
-
-So the chain is:
+The code selects:
 
 ```text
-desired modular reduction
-        |
-        v
-approximate with polynomial
-        |
-        v
-EvalChebyshevSeries()
-        |
-        v
-homomorphic multiplications/additions
+K = 16
 ```
+
+for one LWE parameter choice and:
+
+```text
+K = 128
+```
+
+for another.
+
+The prescale is:
+
+```text
+prescale = 1 / (q*K)
+```
+
+Conceptually:
+
+```text
+B - A*s
+      |
+      | divide by q
+      v
+message-scale quantity
+      |
+      | divide by K
+      v
+small normalized interval
+      |
+      v
+Chebyshev / sine approximation
+```
+
+The reason for doing this before the polynomial approximation is to place the
+input into the interval for which the stored polynomial approximation was
+generated.
 
 ---
 
-# 29. Post-Scaling
+# 33. Post-Scaling
 
-After the modular approximation, the code determines:
+After the modular-reduction polynomial has been evaluated, the source
+computes:
 
 ```cpp
 double postScale =
     (p >= 1 && p <= 4) ? (2.0 * M_PI) : static_cast<double>(p);
 ```
 
-and, if a nonzero `pmin` is supplied:
+and, when needed:
 
 ```cpp
 postScale *= (pmax - pmin) / 4.0;
-postBias = (pmax - pmin) / 4.0;
 ```
-
-The source comments explain that this accounts for the plaintext modulus and, when needed, the desired output interval. fileciteturn15file0L10-L26
 
 Conceptually:
 
 ```text
 normalized recovered value
         |
-        | × postScale
         v
-correct CKKS numerical scale
+multiply by postScale
+        |
+        v
+restore the desired message scale
 ```
+
+The exact factor depends on the plaintext modulus and output encoding.
 
 ---
 
-# 30. Post-Scale Plaintext Multiplication
+# 34. Post-Bias
 
-The code constructs a plaintext containing `postScale` in the first
-`numValues` positions:
-
-```cpp
-auto postScalePlain =
-    ccCKKS->MakeCKKSPackedPlaintext(...);
-```
-
-and then:
+If a nonzero `pmin` is used, the code also computes:
 
 ```cpp
-auto BminusAdotSres =
-    ccCKKS->EvalMult(BminusAdotS3, postScalePlain);
+postBias = (pmax - pmin) / 4.0;
 ```
 
-Mathematically:
-
-```text
-BminusAdotSres
-    = postScale × BminusAdotS3
-```
-
-This converts the normalized approximation into the desired CKKS output range. fileciteturn15file0L24-L37
-
----
-
-# 31. Post-Bias
-
-If the output interval requires a bias, the code creates:
+Then creates:
 
 ```cpp
-postBiasPlain
+postBiasPlain =
+    ccCKKS->MakeCKKSPackedPlaintext(
+        postBiasVec,
+        ...
+    );
 ```
 
-and performs:
+and adds:
 
 ```cpp
 ccCKKS->EvalAddInPlace(
     BminusAdotSres,
-    postBiasPlain);
+    postBiasPlain
+);
 ```
 
-Mathematically:
+Conceptually:
 
 ```text
-output = scaled_value + postBias
+scaled value
+    +
+offset
+    =
+final encoded CKKS value
 ```
 
-This is what converts the normalized interval to the requested `[pmin, pmax]`-style output encoding. fileciteturn15file0L38-L42
+This is needed when the target output interval is not centered at zero.
 
 ---
 
-# 32. Restoring Sparse Encoding
+# 35. Restore Sparse Encoding
 
-The code checks:
+If the CKKS context uses sparse packing:
 
 ```cpp
 if (isSparse) {
-    for (uint32_t j = 1; j < N / (2 * slots); j <<= 1) {
-        auto temp = ccCKKS->EvalAtIndex(
+    for (...) {
+        auto temp =
+            ccCKKS->EvalAtIndex(
+                BminusAdotSres,
+                j * slots
+            );
+
+        ccCKKS->EvalAddInPlace(
             BminusAdotSres,
-            j * slots);
-        ccCKKS->EvalAddInPlace(BminusAdotSres, temp);
+            temp
+        );
     }
+
     BminusAdotSres->SetSlots(slots);
 }
 ```
@@ -1107,410 +1565,487 @@ if (isSparse) {
 Conceptually:
 
 ```text
-partially packed result
+full / repeated intermediate encoding
         |
         v
-combine repeated blocks
+sum the repeated blocks
         |
         v
-restore sparse CKKS layout
+original sparse-slot organization
 ```
 
-The source calls this “Go back to the sparse encoding if needed.” fileciteturn15file0L44-L51
+This is encoding-layout restoration, not message computation.
 
 ---
 
-# 33. Final Modulus Reduction
-
-For `FIXEDMANUAL` scaling, the source finally performs:
-
-```cpp
-ccCKKS->ModReduceInPlace(BminusAdotSres);
-```
-
-This consumes a modulus level and returns the ciphertext at the expected level/scaling state. fileciteturn15file0L53-L57
-
----
-
-# 34. Complete Mathematical Flow
-
-The entire FHEW → CKKS conversion can be summarized as:
+# 36. Complete FHEW → CKKS Tree
 
 ```text
-LWE ciphertexts:
-
-(ai, bi)
-
-where
-
-bi = ai · s + Δmi + ei   (mod q)
-
-        |
-        | encode ai as matrix A
-        | encode bi as vector B
-        v
-
-A = [a0; a1; ...]
-B = [b0, b1, ...]
-
-        |
-        | CKKS encrypt s
-        v
-
-Enc(s)
-
-        |
-        | homomorphic linear transform
-        v
-
-Enc(A*s)
-
-        |
-        | plaintext B - ciphertext A*s
-        v
-
-Enc(B - A*s)
-
-        |
-        | LWE equation
-        v
-
-Enc(Δm + e)
-
-        |
-        | polynomial / sine-based modular reduction
-        v
-
-normalized message representation
-
-        |
-        | postScale + postBias
-        v
-
-CKKS ciphertext containing the FHEW results
-```
-
----
-
-# 35. Complete Function Tree With Mathematical Meaning
-
-```text
-EvalFHEWtoCKKS()
+SWITCHCKKSRNS::EvalFHEWtoCKKS()
 |
-+-- Step 1: build A and B
-|      |
-|      +-- LWE.GetA()
-|      |      -> a_i
-|      |
-|      +-- LWE.GetB()
-|             -> b_i
++-- determine:
+|     +-- numValues
+|     +-- slots
+|     +-- LWE dimension n
+|     +-- K
+|     +-- prescale
 |
-+-- Step 2: EvalPartialHomDecryption()
-|      |
-|      +-- pad A to power-of-two columns
-|      |
-|      +-- EvalLTRectPrecomputeSwitch()
-|      |      |
-|      |      +-- ExtractShiftedDiagonal()
-|      |      |      -> D_k
-|      |      |
-|      |      +-- scale D_k
-|      |      +-- arrange diagonals for BSGS
-|      |
-|      +-- EvalLTRectWithPrecomputeSwitch()
-|             |
-|             +-- EvalFastRotationPrecompute()
-|             |      -> rotation preparation
-|             |
-|             +-- EvalFastRotationExt()
-|             |      -> Rot_k(Enc(s))
-|             |
-|             +-- KeySwitchExt()
-|             |      -> representation management
-|             |
-|             +-- EvalMultExt()
-|             |      -> D_k ⊙ Rot_k(Enc(s))
-|             |
-|             +-- EvalAddExtInPlace()
-|             |      -> accumulate Σ D_k ⊙ Rot_k(s)
-|             |
-|             +-- giant-step automorphism / rotation
-|             |
-|             +-- KeySwitchDown()
-|                    -> normal CKKS representation
++-- form A
+|     |
+|     +-- copy every LWE a-vector
 |
-|      -> AdotS = Enc(A*s)
++-- form b
+|     |
+|     +-- prescale every LWE b-value
 |
-+-- Step 3: B - A*s
-|      |
-|      +-- MakeCKKSPackedPlaintext(B)
-|      +-- EvalNegate(AdotS)
-|      +-- EvalAdd()
-|             -> Enc(B - A*s)
++-- EvalPartialHomDecryption()
+|   |
+|   +-- pad A columns to power of two
+|   |
+|   +-- EvalLTRectPrecomputeSwitch()
+|   |   |
+|   |   +-- ExtractShiftedDiagonal()
+|   |   +-- scale
+|   |   +-- arrange BSGS diagonals
+|   |
+|   +-- EvalLTRectWithPrecomputeSwitch()
+|       |
+|       +-- calculate bStep / gStep
+|       |
+|       +-- EvalFastRotationPrecompute()
+|       |
+|       +-- EvalFastRotationExt()
+|       |       -> rotate encrypted LWE secret key
+|       |
+|       +-- KeySwitchExt()
+|       |
+|       +-- EvalMultExt()
+|       |       -> Dk ⊙ Rotk(s)
+|       |
+|       +-- EvalAddExtInPlace()
+|       |       -> sum diagonal terms
+|       |
+|       +-- giant-step automorphisms
+|       |
+|       +-- KeySwitchDownFirstElement()
+|       |
+|       +-- KeySwitchDown()
+|       |
+|       v
+|       AdotS = A*s
 |
-+-- Step 4: modular reduction / sine approximation
-|      |
-|      +-- EvalChebyshevSeries()
-|      |      -> polynomial approximation
-|      |
-|      +-- EvalMult()
-|      +-- EvalAddInPlace()
-|      +-- EvalSubInPlace()
-|             -> iterative refinement
++-- MakeCKKSPackedPlaintext(b)
+|       |
+|       v
+|       BPlain
 |
-+-- Step 5: output scaling
-|      |
-|      +-- EvalMult(postScalePlain)
-|      +-- EvalAddInPlace(postBiasPlain)
++-- EvalNegate(AdotS)
 |
-+-- sparse-encoding restoration if needed
++-- EvalAdd(BPlain, -AdotS)
+|       |
+|       v
+|       B - A*s
 |
-+-- optional ModReduce()
++-- EvalChebyshevSeries(...)
+|       |
+|       v
+|       polynomial approximation
 |
-+v
++-- repeated:
+|     +-- EvalMult(x, x)
+|     +-- EvalAddInPlace(x, x)
+|     +-- EvalSubInPlace(x, scalar)
+|     |
+|     v
+|     refined modular reduction
+|
++-- postScale
+|
++-- postBias
+|
++-- restore sparse encoding if needed
+|
++-- final ModReduce
+|
+v
 CKKS ciphertext
 ```
 
 ---
 
-# 36. What `m_FHEWtoCKKSswk` Really Is
+# 37. Mathematical View of the Same Tree
 
-The most important object to understand is:
+The whole FHEW → CKKS path can be summarized mathematically as:
 
-```cpp
+```text
+LWE ciphertexts:
+
+bi = ai · s + Δmi + ei   (mod q)
+
+        |
+        v
+
+A =
+[ a0^T
+  a1^T
+  ...
+]
+
+b =
+[ b0
+  b1
+  ...
+]
+
+        |
+        v
+
+homomorphically evaluate:
+
+A*s
+
+        |
+        v
+
+construct:
+
+b - A*s
+
+        |
+        v
+
+approximately obtain:
+
+Δm + e   (mod q)
+
+        |
+        v
+
+normalize by q and K
+
+        |
+        v
+
+evaluate polynomial approximation
+to the required periodic/modular function
+
+        |
+        v
+
+post-scale + post-bias
+
+        |
+        v
+
+CKKS ciphertext containing
+the recovered message values
+```
+
+---
+
+# 38. Exact Conceptual Mapping of the Important Operations
+
+```text
+Mathematical operation                       OpenFHE operation
+====================================================================
+
+collect LWE ai vectors                      GetA()
+
+collect LWE bi values                       GetB()
+
+construct LWE coefficient matrix A          A[i][j] = a[j]
+
+homomorphically encode secret key s          m_FHEWtoCKKSswk
+
+matrix A times secret key s                  EvalPartialHomDecryption()
+
+pad A for power-of-two transform             Acopy[i].resize(cols_po2)
+
+diagonalize A                                EvalLTRectPrecomputeSwitch()
+
+extract shifted diagonal                    ExtractShiftedDiagonal()
+
+encode/use transform diagonal                Apre / plaintext diagonal
+
+rotate encrypted s                           EvalFastRotationExt()
+
+plaintext diagonal × rotated s               EvalMultExt()
+
+sum diagonal contributions                  EvalAddExtInPlace()
+
+giant-step automorphism                     FindAutomorphismIndex2nComplex()
+
+return from extended representation          KeySwitchDown*()
+
+construct CKKS plaintext for B              MakeCKKSPackedPlaintext()
+
+negate A*s                                   EvalNegate()
+
+compute B - A*s                             EvalAdd(...)
+
+approximate modular/periodic function        EvalChebyshevSeries()
+
+polynomial refinement                        EvalMult + EvalAdd + EvalSub
+
+restore message scale                       postScale
+
+restore shifted output range                 postBias
+
+restore sparse packing                       EvalAtIndex + EvalAddInPlace
+
+final CKKS level reduction                   ModReduce...
+```
+
+---
+
+# 39. The Most Important Distinction: `A*s` Is Homomorphic
+
+The most important conceptual point in this whole function is:
+
+```text
+The code does NOT decrypt the LWE ciphertexts.
+```
+
+It knows:
+
+```text
+A = public LWE a-vectors
+B = public LWE b-values
+```
+
+but `s` remains secret.
+
+Instead, OpenFHE has:
+
+```text
+encrypted CKKS representation of s
+```
+
+in:
+
+```text
 m_FHEWtoCKKSswk
 ```
 
-It is a **CKKS ciphertext encrypting the FHEW/LWE secret key**.
-
-So the data flow is:
-
-```text
-FHEW secret key s
-       |
-       | encode as CKKS plaintext
-       v
-CKKS plaintext s
-       |
-       | Encrypt(publicKey, ...)
-       v
-m_FHEWtoCKKSswk = Enc(s)
-```
-
-Then:
-
-```text
-A plaintext
-     ×
-Enc(s)
-     |
-     v
-Enc(A*s)
-```
-
-This is why the process is called **partial homomorphic decryption**: the decryption formula is evaluated homomorphically, but the final result is not produced by explicitly decrypting the LWE ciphertext in ordinary software.
-
-The source explicitly creates the CKKS encryption of the FHEW secret key during switching-key generation. fileciteturn16file0L26-L44
-
----
-
-# 37. The Most Important Distinction: `A` vs `Dk`
-
-There are three different objects to keep separate:
-
-```text
-A
-=
-original matrix formed from the LWE a-vectors
-```
-
-then:
-
-```text
-A
- |
- | ExtractShiftedDiagonal()
- v
-D0, D1, D2, ...
-```
-
-and finally:
-
-```text
-Dk
- |
- | plaintext representation
- v
-precomputed diagonal data
-```
-
-Thus:
-
-```text
-LWE ciphertexts
-      |
-      v
-A = matrix of a-vectors
-      |
-      v
-Dk = diagonals of A
-      |
-      v
-Σ Dk ⊙ Rotk(Enc(s))
-      |
-      v
-Enc(A*s)
-```
-
-This is the cleanest way to connect the source code to the diagonal linear-transform formulation.
-
----
-
-# 38. Why This Is Not Ordinary Decryption
-
-Ordinary LWE decryption would be:
-
-```text
-receive (a,b)
-      |
-      v
-compute b - a*s using secret key s
-      |
-      v
-round / decode
-```
-
-But in scheme switching, the goal is to keep the result encrypted in CKKS.
-
-OpenFHE therefore performs:
-
-```text
-receive encrypted LWE ciphertexts
-          |
-          v
-extract a and b as numerical data
-          |
-          +--------------------------+
-          |                          |
-          v                          v
-       A plaintext              B plaintext
-          |                          |
-          | × Enc(s)                 |
-          v                          |
-       Enc(A*s)                      |
-          |                          |
-          +---------- B - A*s -------+
-                     |
-                     v
-          polynomial modular reduction
-                     |
-                     v
-              CKKS ciphertext
-```
-
-That is the essential architecture of OpenFHE's FHEW → CKKS scheme switch.
-
----
-
-# 39. One-Line Meaning of Each Important Function
-
-```text
-EvalSchemeSwitchingKeyGen()
-    = generate the key material needed for scheme switching, including
-      the CKKS encryption of the FHEW secret key
-
-EvalFHEWtoCKKS()
-    = perform the complete FHEW/LWE -> CKKS conversion
-
-EvalPartialHomDecryption()
-    = homomorphically evaluate A*s using the encrypted LWE secret key
-
-EvalLTRectPrecomputeSwitch()
-    = convert the LWE coefficient matrix A into a diagonal/BSGS form
-
-EvalLTRectWithPrecomputeSwitch()
-    = evaluate that diagonal linear transform on Enc(s)
-
-EvalFastRotationPrecompute()
-    = prepare reusable data for several rotations
-
-EvalFastRotationExt()
-    = perform encrypted CKKS slot rotations
-
-KeySwitchExt()
-    = prepare extended-RNS ciphertext representation
-
-EvalMultExt()
-    = diagonal plaintext × rotated encrypted secret key
-
-EvalAddExtInPlace()
-    = accumulate the diagonal products
-
-KeySwitchDown()
-    = return from the extended representation
-
-MakeCKKSPackedPlaintext()
-    = encode B as a CKKS plaintext
-
-EvalNegate()
-    = negate Enc(A*s)
-
-EvalAdd()
-    = compute Enc(B - A*s)
-
-EvalChebyshevSeries()
-    = homomorphically evaluate the polynomial approximation used for
-      modular/sine reduction
-
-EvalMult()
-    = perform final numerical post-scaling
-
-EvalAddInPlace()
-    = apply final bias or combine repeated sparse blocks
-
-ModReduceInPlace()
-    = consume a CKKS modulus level when required
-```
-
----
-
-# 40. Final Mental Model
-
-When reading `EvalFHEWtoCKKS()`, think:
-
-```text
-I have LWE ciphertexts:
-
-    (a_i, b_i)
-
-with:
-
-    b_i = a_i · s + Δm_i + e_i   (mod q)
-
-I want the messages m_i in CKKS.
-
-1. Put all a_i vectors into matrix A.
-2. Put all b_i values into B.
-3. Encrypt the FHEW secret key s as a CKKS ciphertext.
-4. Homomorphically evaluate A*s using a diagonal linear transform.
-5. Compute B - A*s.
-6. Apply the polynomial/sine-based modular reduction.
-7. Apply post-scaling and post-bias.
-8. Return one CKKS ciphertext containing the converted values.
-```
-
-The central mathematical identity is therefore:
-
-```text
-b - a · s = Δm + e   (mod q)
-```
-
-and the central implementation identity is:
+Therefore:
 
 ```text
 A*s
-  = Σk Dk ⊙ Rotk(s)
 ```
 
-with `s` represented by the encrypted CKKS switching key
-`m_FHEWtoCKKSswk`.
+is evaluated homomorphically.
+
+The flow is:
+
+```text
+             encrypted s
+                 |
+                 v
+       +---------------------+
+       |   linear transform  |
+       |                     |
+       |       A*s           |
+       +---------------------+
+                 |
+                 v
+          encrypted A*s
+```
+
+This is why `EvalLTRectWithPrecomputeSwitch()` is required in the
+FHEW → CKKS path.
+
+---
+
+# 40. The Core Equation to Keep in Mind
+
+For the FHEW → CKKS direction, keep this equation in mind:
+
+```text
+b = A*s + Δm + e   (mod q)
+```
+
+Therefore:
+
+```text
+b - A*s = Δm + e   (mod q)
+```
+
+OpenFHE implements this as:
+
+```text
+LWE a-vectors
+      |
+      v
+      A
+      |
+      | homomorphic linear transform
+      v
+   encrypted A*s
+      |
+      +------------------+
+                         |
+b --------------------> subtract
+                         |
+                         v
+                    B - A*s
+                         |
+                         v
+              polynomial / sine-based
+                 modular reduction
+                         |
+                         v
+                  recovered message
+                         |
+                         v
+                    CKKS ciphertext
+```
+
+---
+
+# 41. One-Line Explanation of Each Function
+
+```text
+EvalFHEWtoCKKS()
+    = perform the complete FHEW -> CKKS scheme switch
+
+EvalPartialHomDecryption()
+    = homomorphically evaluate A*s
+
+EvalLTRectPrecomputeSwitch()
+    = convert the LWE coefficient matrix A into
+      a diagonalized linear-transform representation
+
+EvalLTRectWithPrecomputeSwitch()
+    = evaluate that linear transform on the encrypted LWE secret key
+
+EvalFastRotationPrecompute()
+    = prepare reusable data for multiple CKKS rotations
+
+EvalFastRotationExt()
+    = homomorphically rotate the encrypted LWE secret key
+
+KeySwitchExt()
+    = prepare/use the extended-RNS ciphertext representation
+
+EvalMultExt()
+    = multiply a rotated secret-key ciphertext by a transform diagonal
+
+EvalAddExtInPlace()
+    = accumulate the diagonal contributions
+
+KeySwitchDownFirstElement()
+    = extract/restore the first component from the extended representation
+
+KeySwitchDown()
+    = return the result from the extended representation
+
+MakeCKKSPackedPlaintext()
+    = encode the LWE b-values as a CKKS plaintext
+
+EvalNegate()
+    = negate the encrypted A*s result
+
+EvalAdd()
+    = compute B - A*s
+
+EvalChebyshevSeries()
+    = evaluate the polynomial approximation used for modular reduction
+
+EvalMult()
+    = perform encrypted polynomial multiplication
+
+EvalAddInPlace()
+    = accumulate/add encrypted polynomial terms
+
+EvalSubInPlace()
+    = subtract the stage-dependent constant
+
+ModReduce()
+    = reduce the CKKS modulus-chain level
+
+EvalAtIndex()
+    = rotate/access slots used to restore sparse packing
+
+m_FHEWtoCKKSswk
+    = CKKS ciphertext containing the encoded/encrypted FHEW/LWE secret key
+```
+
+---
+
+# 42. Final Mental Model
+
+When reading:
+
+```cpp
+EvalFHEWtoCKKS(...)
+```
+
+think:
+
+```text
+"I have LWE ciphertexts:
+
+    (ai, bi)
+
+satisfying:
+
+    bi = ai*s + Δmi + ei  (mod q)
+
+I construct:
+
+    A = [a0^T; a1^T; ...]
+
+and:
+
+    b = [b0, b1, ...]
+
+I already have the LWE secret key s encrypted in CKKS.
+
+So I homomorphically compute:
+
+    A*s
+
+using a diagonalized linear transform.
+
+Then I compute:
+
+    b - A*s
+
+which is the LWE decryption expression.
+
+Finally I use the polynomial/sine-based modular reduction,
+post-scale, and post-bias to recover values in CKKS slots."
+```
+
+The central mathematical correspondence is therefore:
+
+```text
+LWE decryption:
+    b - a*s
+
+Multiple LWE ciphertexts:
+    B - A*s
+
+OpenFHE implementation:
+    EvalPartialHomDecryption()
+            |
+            v
+          A*s
+            |
+            v
+    EvalAdd(BPlain, -AdotS)
+            |
+            v
+        B - A*s
+            |
+            v
+    EvalChebyshevSeries()
+            |
+            v
+       recovered CKKS values
+```
+
+The key point is that **FHEW → CKKS is fundamentally a homomorphic
+evaluation of the LWE decryption expression**, followed by an
+approximate modular-reduction procedure that converts the result into a
+usable CKKS representation.
