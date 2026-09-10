@@ -17,61 +17,37 @@ SWITCHCKKSRNS::EvalFHEWtoCKKS(...)
 ```text
 EvalFHEWtoCKKS()
 |
-+-- determine numValues / slots / LWE dimension n
-|
-+-- construct matrix A from LWE a-vectors
-|
-+-- construct vector b from LWE b-values
-|
-+-- compute prescale
-|
 +-- EvalPartialHomDecryption()
 |   |
-|   +-- pad A columns to power of two
-|   |
 |   +-- EvalLTRectPrecomputeSwitch()
-|   |       |
-|   |       +-- extract shifted diagonals
-|   |       +-- scale diagonals
-|   |       +-- organize diagonals for BSGS
 |   |
 |   +-- EvalLTRectWithPrecomputeSwitch()
-|           |
-|           +-- EvalFastRotationPrecompute()
-|           |
-|           +-- EvalFastRotationExt()
-|           |
-|           +-- KeySwitchExt()
-|           |
-|           +-- EvalMultExt()
-|           |
-|           +-- EvalAddExtInPlace()
-|           |
-|           +-- KeySwitchDownFirstElement()
-|           |
-|           +-- KeySwitchDown()
 |
-+-- MakeCKKSPackedPlaintext(b)
++-- MakeCKKSPackedPlaintext()
 |
-+-- EvalNegate(AdotS)
++-- EvalNegate()
 |
-+-- EvalAdd(BPlain, -AdotS)
++-- EvalAdd()
 |
 +-- EvalChebyshevSeries()
-|       |
-|       +-- polynomial approximation of modular reduction
 |
-+-- repeated EvalMult / EvalAdd / EvalSub
-|       |
-|       +-- sine-based modular-reduction refinement
++-- EvalMult()
 |
-+-- post-scale
++-- EvalAddInPlace()
 |
-+-- post-bias
++-- EvalSubInPlace()
 |
-+-- restore sparse encoding if required
++-- MakeCKKSPackedPlaintext()
 |
-+-- final ModReduce if required
++-- EvalMult()
+|
++-- EvalAddInPlace()
+|
++-- EvalAtIndex()
+|
++-- EvalAddInPlace()
+|
++-- ModReduceInPlace()
 |
 +-- return CKKS ciphertext
 ```
