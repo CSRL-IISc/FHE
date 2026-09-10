@@ -1,6 +1,6 @@
 # OpenFHE CKKS → FHEW Scheme Switching
 
-This note explains **only the CKKS → FHEW path** in OpenFHE's
+This document explains **the CKKS → FHEW path** in OpenFHE's
 `ckksrns-schemeswitching.cpp`, including the function-call tree,
 important code operations, and their mathematical interpretation.
 
