@@ -376,7 +376,7 @@ The script also prints the same ciphertexts in the TFHE sign convention
 
 ## 8. QUESTIONS 
 
-1. **S2C & NTT Question**For the S2C evaluation, we have to compute the Halevi-Shoup homomorphic matrix multiplication. Since this requires many ciphertext-plaintext polynomial multiplications, should I build a dedicated NTT (Number Theoretic Transform) pipeline for this? Or given the structure of the S2C matrix, can we compute it more efficiently using a systolic array architecture to minimize memory reads? 
+1. **S2C & NTT Question**For the S2C evaluation, we have to compute the homomorphic matrix multiplication. Since this requires many ciphertext-plaintext polynomial multiplications, should I build a dedicated NTT (Number Theoretic Transform) pipeline for this? Or given the structure of the S2C matrix, can we compute it more efficiently using a systolic array architecture to minimize memory reads? 
 2. **Galois Key Streaming** S2C requires many slot rotations, which means we need to pull in massive Galois evaluation keys. Since these won't fit entirely in on-chip SRAM/BRAM, how do you recommend architecting the memory interface to stream these from off-chip DDR without stalling the polynomial multiplication pipelines?
 3. **RNS** CKKS relies heavily on Residue Number System (RNS) limbs to handle the large $Q$. At what exact stage in the hardware pipeline should we break out of RNS and drop down to the single-limb TFHE representation to minimize routing congestion?
 4. How should I handle the CKKS scaling factor in hardware? Should I build a dedicated fixed-point rounding unit right before the modulus switch, or can we just truncate the lower bits to save area?
