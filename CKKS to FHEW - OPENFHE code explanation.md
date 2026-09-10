@@ -1,1162 +1,1123 @@
-# OpenFHE CKKS ↔ TFHE Scheme Switching
+# OpenFHE CKKS Scheme Switching — Function Call Tree and Mathematical Mapping
 
-## 1. Scope
+## 1. Overview
 
-This note explains the function-call flow around `ckksrns-schemeswitching.cpp`, with emphasis on:
-
-- `EvalCKKStoFHEW()`
-- `EvalFHEWtoCKKS()`
-- the CKKS linear transforms used during switching
-- LWE extraction from the RLWE ciphertext
-- the caller `EvalMinSchemeSwitching()`
-
-The descriptions below are based on the supplied OpenFHE source files and follow the terminology used there.
-
----
-
-# 2. Main Runtime Call Tree: CKKS → FHEW
-
-```text
-SWITCHCKKSRNS::EvalCKKStoFHEW()
-│
-├── 1. EvalSlotsToCoeffsSwitch()
-│      │
-│      └── EvalLTWithPrecomputeSwitch()
-│             │
-│             ├── cc.EvalFastRotationPrecompute()
-│             ├── cc.EvalFastRotationExt()
-│             ├── cc.KeySwitchExt()
-│             ├── FHECKKSRNS::EvalMultExt()
-│             ├── FHECKKSRNS::EvalAddExtInPlace()
-│             ├── cc.KeySwitchDownFirstElement()
-│             ├── cc.KeySwitchDown()
-│             └── cc.EvalFastRotationExt()
-│
-├── 2. ModReduceInternalInPlace()
-│
-├── 3. ModSwitch()
-│
-├── 4. ccKS->KeySwitch()
-│
-├── 5. ExtractLWEpacked()
-│      ├── extract RLWE A polynomial coefficients
-│      └── extract RLWE B polynomial coefficients
-│
-├── 6. ExtractLWECiphertext()
-│      └── construct LWECiphertextImpl(a, b)
-│
-└── 7. RoundqQAlter()   [only when Q' != q]
-       ├── round each LWE a coefficient
-       └── round LWE b
-```
-
-The conceptual flow is:
+The CKKS → FHEW scheme-switching path can be viewed as:
 
 ```text
 CKKS ciphertext
-      │
-      ▼
-Slots → coefficients
-      │
-      ▼
-Modulus reduce / switch
-      │
-      ▼
-Key-switch CKKS secret-key domain
-into an RLWE representation of the LWE/FHEW key
-      │
-      ▼
-Packed RLWE polynomial
-      │
-      ▼
-Extract coefficient slices
-      │
-      ▼
-LWE ciphertexts
-      │
-      ▼
-Optional modulus conversion Q' → q
-      │
-      ▼
-FHEW / BinFHE ciphertexts
-```
-
----
-
-# 3. Step-by-Step: `EvalCKKStoFHEW()`
-
-## 3.1 `SWITCHCKKSRNS::EvalCKKStoFHEW()`
-
-**Role:** This is the top-level runtime function that converts selected CKKS slots into a vector of FHEW/LWE ciphertexts.
-
-The implementation first limits the requested number of ciphertexts to the CKKS slot count. It obtains the CKKS crypto context and then performs a slots-to-coefficients transform.
-
-Relevant source behavior:
-
-```cpp
-ctxtDecoded = EvalSlotsToCoeffsSwitch(*ccCKKS, ciphertext);
-ModReduceInternalInPlace(ctxtDecoded, 1);
-ctxtKS = m_ctxtKS->Clone();
-ModSwitch(ctxtDecoded, ctxtKS, m_modulus_CKKS_from);
-ctSwitched = ccKS->KeySwitch(ctxtKS, m_CKKStoFHEWswk);
-```
-
-So this function is mainly an **orchestrator**. It does not implement the linear transform, RLWE coefficient extraction, or LWE construction itself; it calls specialized helpers for those operations.
-
-**File:** `ckksrns-schemeswitching.cpp`
-
----
-
-# 4. Step 1 — `EvalSlotsToCoeffsSwitch()`
-
-## 4.1 What it does
-
-```text
+      |
+      v
 EvalCKKStoFHEW()
-      │
-      └── EvalSlotsToCoeffsSwitch()
+      |
+      +-- EvalSlotsToCoeffsSwitch()
+      |       |
+      |       +-- EvalLTWithPrecomputeSwitch()
+      |               |
+      |               +-- rotations
+      |               +-- plaintext diagonal multiplication
+      |               +-- additions
+      |
+      +-- ModSwitch()
+      |
+      +-- KeySwitch()
+      |
+      +-- ExtractLWEpacked()
+      |
+      +-- ExtractLWECiphertext()
+      |
+      +-- RoundqQAlter()
+      |
+      v
+LWE / FHEW ciphertexts
 ```
 
-CKKS naturally represents packed values in polynomial slots. For scheme switching, OpenFHE needs a representation whose relevant information can be arranged into polynomial coefficients suitable for extraction into LWE ciphertexts.
+The important idea is that CKKS data is initially represented in its
+**slots**, while the later extraction step needs the information in
+specific **polynomial coefficient positions**.
 
-`EvalSlotsToCoeffsSwitch()` therefore performs the CKKS linear transformation:
-
-```text
-slot representation
-        ↓
-coefficient representation
-```
-
-It uses precomputed transform data such as `m_U0Pre`.
-
-The function checks that the required precomputation exists. It also determines the cyclotomic order and checks whether the ring is sparse relative to the expected transform size. For flexible scaling techniques, it can compress the ciphertext to fewer towers and adjust the scaling factor before continuing.
+The linear transform performed by
+`EvalLTWithPrecomputeSwitch()` is the mechanism used to rearrange the
+encrypted data into the required representation.
 
 ---
 
-# 5. `EvalSlotsToCoeffsSwitch()` → `EvalLTWithPrecomputeSwitch()`
+# 2. The Mathematical Idea: Linear Transform
 
-The actual linear transform is evaluated through the precomputed diagonal representation.
+Suppose the CKKS slots contain:
 
 ```text
-EvalSlotsToCoeffsSwitch()
-        │
-        └── EvalLTWithPrecomputeSwitch()
+x = [x0, x1, x2, x3]
 ```
 
-The mathematical structure is approximately:
+and we want to apply a linear transformation:
 
+```text
+y = T · x
+```
 
-y = Σᵢ D_i Rotᵢ(x)
+where `T` is a matrix.
 
+For example:
+
+```text
+T =
+[ t00 t01 t02 t03
+  t10 t11 t12 t13
+  t20 t21 t22 t23
+  t30 t31 t32 t33 ]
+```
+
+Then:
+
+```text
+y0 = t00*x0 + t01*x1 + t02*x2 + t03*x3
+y1 = t10*x0 + t11*x1 + t12*x2 + t13*x3
+y2 = t20*x0 + t21*x1 + t22*x2 + t23*x3
+y3 = t30*x0 + t31*x1 + t32*x2 + t33*x3
+```
+
+Instead of evaluating this matrix multiplication directly, CKKS uses
+a diagonal decomposition.
+
+---
+
+# 3. Diagonal Representation
+
+The matrix can be represented using cyclic diagonals.
+
+For the example above, one possible diagonal representation is:
+
+```text
+D0 = [t00, t11, t22, t33]
+
+D1 = [t01, t12, t23, t30]
+
+D2 = [t02, t13, t20, t31]
+
+D3 = [t03, t10, t21, t32]
+```
+
+The transform can then be written conceptually as:
+
+```text
+y = D0 ⊙ Rot0(x)
+  + D1 ⊙ Rot1(x)
+  + D2 ⊙ Rot2(x)
+  + D3 ⊙ Rot3(x)
+```
 
 where:
 
-- `x` = input CKKS ciphertext
-- `Rot_i(x)` = rotated ciphertext
-- `D_i` = plaintext diagonal corresponding to one rotation
-- `y` = transformed CKKS ciphertext
+```text
+⊙       = slot-wise multiplication
+Rotk(x) = cyclic rotation of the CKKS slots by k
+```
 
-The implementation uses baby-step/giant-step evaluation so that the number of expensive rotations/key-switch operations is reduced.
+For example:
+
+```text
+x = [x0, x1, x2, x3]
+
+Rot0(x) = [x0, x1, x2, x3]
+Rot1(x) = [x1, x2, x3, x0]
+Rot2(x) = [x2, x3, x0, x1]
+Rot3(x) = [x3, x0, x1, x2]
+```
+
+Therefore:
+
+```text
+D0 ⊙ Rot0(x)
+= [t00*x0, t11*x1, t22*x2, t33*x3]
+
+D1 ⊙ Rot1(x)
+= [t01*x1, t12*x2, t23*x3, t30*x0]
+
+D2 ⊙ Rot2(x)
+= [t02*x2, t13*x3, t20*x0, t31*x1]
+
+D3 ⊙ Rot3(x)
+= [t03*x3, t10*x0, t21*x1, t32*x2]
+```
+
+Adding them gives:
+
+```text
+y0 = t00*x0 + t01*x1 + t02*x2 + t03*x3
+
+y1 = t10*x0 + t11*x1 + t12*x2 + t13*x3
+
+y2 = t20*x0 + t21*x1 + t22*x2 + t23*x3
+
+y3 = t30*x0 + t31*x1 + t32*x2 + t33*x3
+```
+
+Therefore:
+
+```text
+y = T · x
+```
+
+This is the diagonalized matrix-vector multiplication described in the
+FHE Textbook's matrix multiplication formulation.
+
+---
+
+# 4. Important Meaning of `A` in OpenFHE
+
+There are two different things that can be called `A`.
+
+## 4.1 `A` in ordinary matrix notation
+
+In:
+
+```text
+y = A · x
+```
+
+`A` means the original dense transformation matrix.
+
+## 4.2 `A` in `EvalLTWithPrecomputeSwitch()`
+
+In OpenFHE:
+
+```cpp
+EvalLTWithPrecomputeSwitch(cc, ctxt, A, dim1)
+```
+
+the parameter `A` is a vector of **precomputed plaintexts**.
+
+These plaintexts represent the diagonals of the transformation matrix.
+
+Conceptually:
+
+```text
+Original matrix T
+      |
+      +-- extract shifted diagonal
+      |
+      v
+D0, D1, D2, D3, ...
+      |
+      +-- MakeAuxPlaintext()
+      |
+      v
+A[0], A[1], A[2], A[3], ...
+```
+
+Thus:
+
+```text
+A[0]  -> plaintext encoding of D0
+A[1]  -> plaintext encoding of D1
+A[2]  -> plaintext encoding of D2
+...
+```
+
+So `A[k]` in:
+
+```cpp
+A[bStep*j + i]
+```
+
+should be interpreted as:
+
+```text
+the plaintext containing one transformation-matrix diagonal
+```
+
+not as an individual matrix element.
+
+---
+
+# 5. `EvalLTPrecomputeSwitch()`
+
+## Purpose
+
+`EvalLTPrecomputeSwitch()` prepares the plaintext diagonal representation
+of the linear transformation.
+
+Its conceptual flow is:
+
+```text
+Transformation matrix T
+        |
+        v
+ExtractShiftedDiagonal(...)
+        |
+        v
+D0, D1, D2, ...
+        |
+        v
+scale / arrange coefficients
+        |
+        v
+MakeAuxPlaintext(...)
+        |
+        v
+A[0], A[1], A[2], ...
+```
+
+## Important operation
+
+The source contains:
+
+```cpp
+ExtractShiftedDiagonal(newA, ji)
+```
+
+This extracts a shifted/cyclic diagonal from the transformation matrix.
+
+Then the diagonal is converted into a CKKS plaintext through:
+
+```cpp
+FHECKKSRNS::MakeAuxPlaintext(...)
+```
+
+Therefore:
+
+```text
+EvalLTPrecomputeSwitch()
+        =
+construct plaintext diagonals needed by the linear transform
+```
+
+It does not yet apply the transform to the encrypted ciphertext.
 
 ---
 
 # 6. `EvalLTWithPrecomputeSwitch()`
 
-## 6.1 What it does
+## Purpose
 
-This function evaluates a precomputed CKKS linear transform.
-
-Its major stages are:
+This function takes:
 
 ```text
-EvalLTWithPrecomputeSwitch()
-│
-├── determine baby-step / giant-step dimensions
-│
-├── EvalFastRotationPrecompute()
-│
-├── generate required rotated ciphertexts
-│
-├── multiply rotations by precomputed plaintext diagonals
-│
-├── add partial results
-│
-└── key-switch / combine results
+1. the encrypted CKKS ciphertext
+2. the precomputed diagonal plaintexts
 ```
 
-The implementation computes quantities such as:
+and actually evaluates the linear transformation.
+
+Conceptually:
+
+```text
+                 ciphertext x
+                       |
+          +------------+------------+
+          |            |            |
+          v            v            v
+        Rot0          Rot1         Rot2 ...
+          |            |            |
+          v            v            v
+       × D0          × D1         × D2
+          |            |            |
+          +------------+------------+
+                       |
+                       v
+                     add
+                       |
+                       v
+                       y
+```
+
+The mathematical form is:
+
+```text
+y = Σk Dk ⊙ Rotk(x)
+```
+
+or, for the 4-slot example:
+
+```text
+y = D0 ⊙ Rot0(x)
+  + D1 ⊙ Rot1(x)
+  + D2 ⊙ Rot2(x)
+  + D3 ⊙ Rot3(x)
+```
+
+---
+
+# 7. Mapping the OpenFHE Operations
+
+## 7.1 `EvalFastRotationPrecompute()`
+
+OpenFHE:
 
 ```cpp
-slots  = ...
-bStep  = dim1
-gStep  = ceil(slots / bStep)
 digits = cc.EvalFastRotationPrecompute(ctxt);
 ```
 
-The important idea is that the transform is decomposed into **giant steps** and **baby steps**.
-
----
-
-## 6.2 `EvalFastRotationPrecompute()`
-
-**Purpose:** Prepare the information needed to evaluate many rotations of the same CKKS ciphertext efficiently.
-
-Instead of independently performing the full work for every rotation, OpenFHE performs a common precomputation once and reuses it.
-
 Conceptually:
 
 ```text
-ciphertext
-   │
-   └── hoisted / shared rotation data
-             │
-             ├── rotation 1
-             ├── rotation 2
-             ├── rotation 3
-             └── ...
+prepare information needed for multiple ciphertext rotations
 ```
 
-This is particularly useful inside baby-step/giant-step linear transforms, where many related rotations are needed.
+This is an optimization.
+
+It does not represent a new mathematical term in the matrix multiplication.
 
 ---
 
-## 6.3 `EvalFastRotationExt()`
+# 8. `EvalFastRotationExt()`
 
-**Purpose:** Produce a rotated version of the CKKS ciphertext using the precomputed rotation information.
-
-The `Ext` form operates with the extended ciphertext representation used by the RNS CKKS implementation.
-
-In the linear transform it is used to obtain the rotations corresponding to the baby steps and giant steps.
-
-Conceptually:
-
-```text
-precomputed rotation data
-          + rotation index
-                 │
-                 ▼
-        rotated CKKS ciphertext
-```
-
----
-
-## 6.4 `KeySwitchExt()`
-
-**Purpose:** Convert the extended representation into the form required for the extended CKKS multiplication/evaluation path.
-
-In this code it appears in expressions such as:
+OpenFHE:
 
 ```cpp
-FHECKKSRNS::EvalMultExt(cc.KeySwitchExt(ctxt, true), A[...])
+cc.EvalFastRotationExt(ctxt, i, digits, true)
 ```
 
-So its job is part of the internal RNS/extended ciphertext path used before multiplying by a plaintext diagonal.
+Conceptually:
+
+```text
+Rot_i(x)
+```
+
+That is, it performs a homomorphic CKKS slot rotation.
+
+So:
+
+```text
+FHE Textbook operation       OpenFHE operation
+------------------------------------------------
+Rot_i(x)                     EvalFastRotationExt(...)
+```
 
 ---
 
-## 6.5 `FHECKKSRNS::EvalMultExt()`
+# 9. `EvalMultExt()`
 
-**Purpose:** Multiply an extended CKKS ciphertext by a plaintext in the extended-RNS evaluation path.
-
-In the linear transform:
+OpenFHE:
 
 ```cpp
 FHECKKSRNS::EvalMultExt(
-    cc.KeySwitchExt(ctxt, true),
-    A[index]
+    fastRotation[i - 1],
+    A[bStep*j + i]
 )
 ```
 
-Here:
+Conceptually:
 
-- the first argument is the rotated/extended ciphertext
-- the second argument is a precomputed plaintext diagonal
+```text
+Dk ⊙ Rotk(x)
+```
 
-Mathematically:
+where:
 
+```text
+Dk = corresponding plaintext diagonal
+```
 
-D_i · Rotᵢ(x)
+So:
 
+```text
+EvalFastRotationExt(...)
+        |
+        v
+Rotk(x)
 
-The result is one contribution to the final linear transform.
+A[k]
+        |
+        v
+Dk
+
+EvalMultExt(...)
+        |
+        v
+Dk ⊙ Rotk(x)
+```
+
+This is the slot-wise multiplication part of the diagonalized linear
+transform.
 
 ---
 
-## 6.6 `FHECKKSRNS::EvalAddExtInPlace()`
+# 10. `EvalAddExtInPlace()`
 
-**Purpose:** Add another extended ciphertext contribution into the current accumulator.
-
-The code uses it in the form:
+OpenFHE:
 
 ```cpp
 FHECKKSRNS::EvalAddExtInPlace(
     inner,
-    FHECKKSRNS::EvalMultExt(fastRotation[i - 1], A[...])
+    FHECKKSRNS::EvalMultExt(...)
 );
 ```
 
 Conceptually:
 
 ```text
-inner
-  + D_i · Rot_i(x)
-  ─────────────────
-       inner
+accumulator = accumulator + Dk ⊙ Rotk(x)
 ```
 
-Repeated additions build the output of the diagonal linear transform.
+After all terms are added:
+
+```text
+y = D0 ⊙ Rot0(x)
+  + D1 ⊙ Rot1(x)
+  + D2 ⊙ Rot2(x)
+  + ...
+```
+
+Therefore:
+
+```text
+EvalAddExtInPlace()
+        =
+accumulate the diagonal contributions
+```
 
 ---
 
-## 6.7 `KeySwitchDownFirstElement()`
+# 11. Why BSGS Is Used
 
-**Purpose:** Bring the first partial result down from the extended representation into the normal CKKS ciphertext representation.
+A direct implementation would require:
 
-The implementation treats the first giant-step result specially because it can be used as the initial accumulator.
+```text
+Rot0(x)
+Rot1(x)
+Rot2(x)
+Rot3(x)
+...
+RotN-1(x)
+```
+
+For a large number of CKKS slots, this is expensive.
+
+OpenFHE therefore uses **baby-step/giant-step (BSGS)**.
+
+The code contains:
+
+```cpp
+bStep
+gStep
+```
+
+and indexes the diagonal plaintexts using:
+
+```cpp
+A[bStep*j + i]
+```
+
+The rotation index can therefore be viewed as:
+
+```text
+k = j*bStep + i
+```
+
+where:
+
+```text
+j = giant-step index
+i = baby-step index
+```
+
+So:
+
+```text
+A[bStep*j + i]
+```
+
+means approximately:
+
+```text
+D_k
+```
+
+with:
+
+```text
+k = j*bStep + i
+```
+
+The mathematical operation remains:
+
+```text
+Dk ⊙ Rotk(x)
+```
+
+BSGS changes **how efficiently the rotations are generated and reused**.
+
+---
+
+# 12. `KeySwitchExt()`
+
+The source also contains:
+
+```cpp
+cc.KeySwitchExt(ctxt, true)
+```
+
+This should not be interpreted as another matrix-multiplication term.
+
+It is implementation machinery associated with the ciphertext representation
+used by the extended-RNS operations.
 
 Conceptually:
 
 ```text
-extended partial result
-         │
-         ▼
-normal CKKS ciphertext
+linear-transform mathematics
+        |
+        +-- rotations
+        +-- diagonal multiplication
+        +-- additions
+        |
+        +-- key switching / RNS representation management
 ```
+
+The key-switch operation supports the implementation of the transform but
+does not correspond to an additional `Dk ⊙ Rotk(x)` term.
 
 ---
 
-## 6.8 `KeySwitchDown()`
+# 13. `KeySwitchDown()`
 
-**Purpose:** Convert an extended CKKS ciphertext back into the standard CKKS ciphertext form after the extended operations are finished.
+Similarly:
 
-It is used both while combining giant-step results and at the end of the transform.
+```cpp
+cc.KeySwitchDown(...)
+```
 
-So the extended path looks approximately like:
+is associated with moving the ciphertext back from the extended
+representation used during the computation.
+
+Conceptually:
 
 ```text
-normal CKKS
-    ↓
 extended representation
-    ↓
-rotations + plaintext multiplies + adds
-    ↓
+        |
+        v
 KeySwitchDown()
-    ↓
-normal CKKS
+        |
+        v
+normal CKKS representation
 ```
 
----
-
-# 7. Step 2 — `ModReduceInternalInPlace()`
-
-After the slot-to-coefficient transform, the code performs:
-
-```cpp
-ModReduceInternalInPlace(ctxtDecoded, 1);
-```
-
-**Purpose:** Reduce the modulus level of the CKKS ciphertext by removing one level according to the CKKS RNS representation.
-
-This is part of preparing the ciphertext modulus for the subsequent scheme-switching steps.
-
-It is important to distinguish this from the later explicit conversion of the CKKS modulus to the FHEW-compatible modulus. This operation changes the current CKKS modulus level; it is not yet the final CKKS-to-LWE modulus conversion.
-
----
-
-# 8. Step 3 — `ModSwitch()`
-
-The code then creates a clone of a precomputed ciphertext and performs:
-
-```cpp
-ctxtKS = m_ctxtKS->Clone();
-ModSwitch(ctxtDecoded, ctxtKS, m_modulus_CKKS_from);
-```
-
-**Purpose:** Convert the ciphertext representation so that its modulus matches the modulus expected by the key-switching/extraction stage.
-
-At this point it is useful to name the moduli:
+Again, this is implementation detail rather than a new mathematical
+operation in:
 
 ```text
-Q  = original / current CKKS modulus
-Q' = modulus used as the CKKS → FHEW intermediate modulus
-q  = final LWE/FHEW modulus
+y = Σk Dk ⊙ Rotk(x)
 ```
-
-The exact implementation uses `m_modulus_CKKS_from` for the relevant CKKS-side modulus value.
-
-The later `RoundqQAlter()` operation handles the final `Q' → q` conversion when these moduli differ.
 
 ---
 
-# 9. Step 4 — `ccKS->KeySwitch()`
+# 14. `EvalSlotsToCoeffsSwitch()`
 
-The key switching step is:
+This is the higher-level operation in the CKKS → FHEW path.
 
-```cpp
-ccKS->KeySwitch(ctxtKS, m_CKKStoFHEWswk);
-```
-
-**Purpose:** Change the ciphertext from the original CKKS secret-key domain to the key domain that corresponds to the LWE/FHEW secret key.
-
-This is the crucial cryptographic bridge between the CKKS ciphertext and the LWE representation.
-
-The switching key `m_CKKStoFHEWswk` is generated so that the resulting RLWE ciphertext is related to the FHEW/LWE secret key rather than only to the original CKKS secret key.
+Its role is to perform the required linear transformation that converts
+the CKKS slot-oriented representation into the representation needed for
+the later coefficient extraction.
 
 Conceptually:
 
 ```text
-CKKS ciphertext under s_CKKS
-             │
-             │ key switch
-             ▼
-RLWE ciphertext under RLWE representation of s_LWE
+CKKS slot representation
+        |
+        v
+linear transformation
+        |
+        v
+coefficient-oriented representation
+```
+
+Internally it uses:
+
+```text
+EvalLTWithPrecomputeSwitch()
+```
+
+to apply the precomputed transformation.
+
+Thus:
+
+```text
+EvalSlotsToCoeffsSwitch()
+        |
+        +-- prepare / adjust ciphertext
+        |
+        +-- EvalLTWithPrecomputeSwitch()
+                |
+                +-- rotations
+                +-- diagonal multiplications
+                +-- additions
 ```
 
 ---
 
-# 10. How `m_CKKStoFHEWswk` Is Generated
+# 15. Why This Transform Is Needed
 
-The helper involved is:
-
-```text
-switchingKeyGenRLWEcc()
-```
-
-Call structure:
+CKKS logically exposes a vector of slots:
 
 ```text
-Key generation
-│
-└── switchingKeyGenRLWEcc()
-       │
-       ├── read CKKS secret key
-       ├── read LWE secret key
-       ├── construct transformed secret-key representations
-       └── ccCKKSto->KeySwitchGen(oldTransformedSK, RLWELWEsk)
+[x0, x1, x2, ..., xN-1]
 ```
 
-### `switchingKeyGenRLWEcc()`
+But the ciphertext itself is an RLWE polynomial object.
 
-This helper maps the LWE secret-key information into an RLWE-compatible polynomial representation and generates the CKKS key-switching key that maps from the CKKS secret-key representation to it.
+The values in the logical slots are not simply stored as:
 
-The implementation converts the relevant coefficients into values represented by `0`, `1`, or `modulus - 1`, depending on the source CKKS secret-key coefficient and the corresponding LWE secret-key element.
-
-The final call is effectively:
-
-```cpp
-ccCKKSto->KeySwitchGen(oldTranformedSK, RLWELWEsk);
+```text
+coefficient 0 = x0
+coefficient 1 = x1
+...
 ```
 
-The result is the switching key later used by:
+Therefore the scheme-switching process needs a linear transformation to
+rearrange the encoded information.
+
+The conceptual flow is:
+
+```text
+CKKS slots
+    |
+    |  linear transform
+    v
+desired polynomial-coefficient representation
+    |
+    v
+extract polynomial coefficients
+    |
+    v
+LWE ciphertext
+```
+
+This is why the linear transform appears before:
 
 ```cpp
-ccKS->KeySwitch(ctxtKS, m_CKKStoFHEWswk);
+ExtractLWEpacked(...)
+```
+
+and:
+
+```cpp
+ExtractLWECiphertext(...)
 ```
 
 ---
 
-# 11. Step 5 — `ExtractLWEpacked()`
+# 16. `EvalCKKStoFHEW()`
 
-After key switching, the ciphertext is still an RLWE-style ciphertext.
+This is the main CKKS → FHEW runtime function.
 
-The next helper is:
+The flow is:
+
+```text
+EvalCKKStoFHEW()
+|
++-- EvalSlotsToCoeffsSwitch()
+|      |
+|      +-- EvalLTWithPrecomputeSwitch()
+|
++-- ModSwitch()
+|
++-- KeySwitch()
+|
++-- ExtractLWEpacked()
+|
++-- ExtractLWECiphertext()
+|
++-- RoundqQAlter()
+|
+v
+LWE ciphertexts
+```
+
+Each stage has a different purpose.
+
+---
+
+# 17. `ModSwitch()`
+
+After the CKKS linear transform, the ciphertext is moved from the current
+CKKS modulus to the modulus required by the scheme-switching operation.
+
+Conceptually:
+
+```text
+CKKS ciphertext at Q
+        |
+        v
+ModSwitch()
+        |
+        v
+CKKS ciphertext at Q'
+```
+
+This changes the modulus representation.
+
+It is not the linear transformation itself.
+
+---
+
+# 18. `KeySwitch()`
+
+OpenFHE then performs:
+
+```cpp
+ccKS->KeySwitch(ctxtKS, m_CKKStoFHEWswk)
+```
+
+The purpose is to switch from the CKKS secret-key representation to the
+RLWE representation corresponding to the FHEW/LWE secret key.
+
+Conceptually:
+
+```text
+RLWE ciphertext under CKKS key
+            |
+            v
+       KeySwitch
+            |
+            v
+RLWE ciphertext under LWE-derived key
+```
+
+This makes the RLWE ciphertext suitable for coefficient extraction into
+an LWE ciphertext.
+
+---
+
+# 19. `ExtractLWEpacked()`
+
+This function takes the RLWE ciphertext and extracts its polynomial
+coefficient vectors.
+
+Conceptually:
+
+```text
+RLWE ciphertext
+
+(A(X), B(X))
+
+       |
+       v
+
+A = [A0, A1, A2, ...]
+B = [B0, B1, B2, ...]
+```
+
+So:
 
 ```text
 ExtractLWEpacked()
+    =
+extract coefficient representation of RLWE A and B
 ```
 
-Call structure:
-
-```text
-RLWE ciphertext
-     │
-     └── ExtractLWEpacked()
-            ├── extract A polynomial coefficients
-            └── extract B polynomial coefficients
-```
-
-The source takes the first tower/element, converts it to coefficient format, and copies the coefficients of the two RLWE components into vectors.
-
-The conceptual transformation is:
-
-```text
-RLWE ciphertext
-   = (A(X), B(X))
-          │
-          ▼
-A coefficient vector + B coefficient vector
-```
-
-The function does **not** yet create individual LWE ciphertext objects. It only exposes the packed polynomial coefficients.
+It does not yet create separate LWE ciphertexts.
 
 ---
 
-# 12. Step 6 — `ExtractLWECiphertext()`
+# 20. `ExtractLWECiphertext()`
 
-Next, `EvalCKKStoFHEW()` repeatedly calls:
-
-```text
-ExtractLWECiphertext()
-```
-
-Call structure:
-
-```text
-packed A/B coefficient vectors
-          │
-          ▼
-ExtractLWECiphertext(index)
-          │
-          ├── select n coefficients from A
-          ├── rearrange / negate according to the extraction convention
-          └── use B[index] as the LWE b value
-                  │
-                  ▼
-           LWECiphertextImpl(a, b)
-```
-
-The function allocates:
-
-```cpp
-NativeVector a(n, modulus);
-```
-
-and fills it from selected positions in the packed RLWE `A` polynomial.
-
-It then constructs:
-
-```cpp
-LWECiphertextImpl(a, aANDb[0][index])
-```
-
-Thus the packed RLWE result contains enough coefficient information to recover multiple LWE ciphertexts.
-
----
-
-# 13. Why `gap` Exists
-
-The code computes:
-
-```cpp
-gap = ccKS->GetRingDimension() / (2 * m_numSlotsCKKS);
-```
-
-and advances the extraction index by this gap.
+This function takes the packed coefficient representation and chooses
+the coefficient positions corresponding to one LWE ciphertext.
 
 Conceptually:
 
 ```text
-RLWE polynomial coefficients
-
-|--- slot 0 ---| gap |--- slot 1 ---| gap |--- slot 2 ---| ...
-                       ↑
-                 extraction spacing
+packed RLWE coefficients
+        |
+        v
+select appropriate positions
+        |
+        +-- a = [a0, a1, ..., an-1]
+        |
+        +-- b = selected B coefficient
+        |
+        v
+LWE ciphertext (a,b)
 ```
 
-So the LWE ciphertexts are not simply formed from consecutive polynomial coefficients. They are packed at regularly spaced positions determined by the ring dimension and number of CKKS slots.
+The resulting LWE ciphertext has the usual form:
+
+```text
+(a, b)
+```
 
 ---
 
-# 14. Step 7 — `RoundqQAlter()`
+# 21. LWE Equation
 
-The final conversion is conditional:
+For an LWE ciphertext:
 
-```cpp
-if (m_modulus_LWE != m_modulus_CKKS_from)
+```text
+b = a · s + Δm + e  (mod q)
 ```
 
-Then the code applies:
+where:
 
-```cpp
-RoundqQAlter(original_a[j], m_modulus_LWE, m_modulus_CKKS_from);
-RoundqQAlter(original_b,   m_modulus_LWE, m_modulus_CKKS_from);
+```text
+a = LWE vector
+s = LWE secret key
+m = plaintext message
+Δ = message scaling factor
+e = error
+q = LWE modulus
 ```
 
-**Purpose:** Convert the extracted LWE values from the intermediate modulus `Q'` to the final LWE modulus `q` by scaling and rounding.
+Decryption computes:
 
-The intended operation is described in the source as multiplying by the ratio of the target and source moduli and rounding.
+```text
+b - a · s = Δm + e  (mod q)
+```
+
+The expression:
+
+```text
+b - a · s
+```
+
+is therefore the quantity from which the plaintext message is recovered.
+
+---
+
+# 22. `RoundqQAlter()`
+
+The code may have:
+
+```text
+Q' != q
+```
+
+where:
+
+```text
+Q' = modulus used by the CKKS-side representation
+q  = LWE modulus
+```
+
+Therefore the extracted LWE values have to be mapped to the LWE modulus.
+
+The code performs this through:
+
+```cpp
+RoundqQAlter(...)
+```
 
 Conceptually:
 
 ```text
 value modulo Q'
-      │
-      │ × q / Q'
-      │ + rounding
-      ▼
+        |
+        v
+scale from Q' to q
+        |
+        v
+round
+        |
+        v
 value modulo q
 ```
 
-The result is then stored in a new `LWECiphertextImpl`.
+This is the final modulus-conversion step before returning the FHEW/LWE
+ciphertexts.
 
 ---
 
-# 15. CKKS → FHEW: Complete Detailed Tree
+# 23. Complete CKKS → FHEW Tree
 
 ```text
-SWITCHCKKSRNS::EvalCKKStoFHEW()
-│
-├── EvalSlotsToCoeffsSwitch()
-│   │
-│   └── EvalLTWithPrecomputeSwitch()
-│       │
-│       ├── EvalFastRotationPrecompute()
-│       │
-│       ├── EvalFastRotationExt()
-│       │
-│       ├── KeySwitchExt()
-│       │
-│       ├── FHECKKSRNS::EvalMultExt()
-│       │   └── multiply rotated ciphertext by plaintext diagonal
-│       │
-│       ├── FHECKKSRNS::EvalAddExtInPlace()
-│       │   └── accumulate diagonal-transform terms
-│       │
-│       ├── KeySwitchDownFirstElement()
-│       │
-│       └── KeySwitchDown()
-│
-├── ModReduceInternalInPlace()
-│   └── reduce CKKS modulus level
-│
-├── ModSwitch()
-│   └── prepare modulus Q'
-│
-├── ccKS->KeySwitch()
-│   └── switch CKKS key → RLWE representation of LWE key
-│
-├── ExtractLWEpacked()
-│   ├── RLWE A → coefficient vector
-│   └── RLWE B → coefficient vector
-│
-├── ExtractLWECiphertext()
-│   ├── choose coefficient slice for a
-│   ├── use selected B coefficient
-│   └── construct LWECiphertextImpl
-│
-└── RoundqQAlter()
-    └── Q' → q when required
+EvalCKKStoFHEW()
+|
++-- EvalSlotsToCoeffsSwitch()
+|   |
+|   +-- EvalLTWithPrecomputeSwitch()
+|       |
+|       +-- EvalFastRotationPrecompute()
+|       |
+|       +-- EvalFastRotationExt()
+|       |       |
+|       |       +-- Rot_k(x)
+|       |
+|       +-- KeySwitchExt()
+|       |
+|       +-- EvalMultExt()
+|       |       |
+|       |       +-- D_k ⊙ Rot_k(x)
+|       |
+|       +-- EvalAddExtInPlace()
+|       |       |
+|       |       +-- accumulate terms
+|       |
+|       +-- KeySwitchDown()
+|
++-- ModSwitch()
+|
++-- KeySwitch()
+|
++-- ExtractLWEpacked()
+|
++-- ExtractLWECiphertext()
+|
++-- RoundqQAlter()
+|
+v
+LWE ciphertexts
 ```
 
 ---
 
-# 16. Precomputation Tree
+# 24. Mathematical View of the Whole CKKS → FHEW Process
 
-The runtime transform depends on precomputed plaintext diagonals.
-
-```text
-EvalCKKStoFHEWPrecompute()
-│
-├── construct transform matrices / U0 and U1
-│
-└── EvalLTPrecomputeSwitch()
-    │
-    ├── determine CKKS modulus / RNS parameters
-    ├── determine BSGS step
-    ├── ExtractShiftedDiagonal()
-    ├── scale diagonal coefficients
-    ├── Fill()
-    ├── Rotate()
-    └── FHECKKSRNS::MakeAuxPlaintext()
-           │
-           └── produces plaintext representation used later
-               by EvalLTWithPrecomputeSwitch()
-```
-
-The key relationship is:
+At the highest level:
 
 ```text
-Precomputation
-     │
-     ▼
-m_U0Pre / related diagonal plaintexts
-     │
-     ▼
-EvalSlotsToCoeffsSwitch()
-     │
-     ▼
-EvalLTWithPrecomputeSwitch()
+CKKS slots
+    |
+    | y = T · x
+    | where
+    | y = Σk Dk ⊙ Rotk(x)
+    |
+    v
+transformed CKKS representation
+    |
+    | modulus switch
+    v
+Q' representation
+    |
+    | key switch
+    v
+RLWE representation under
+LWE-derived secret key
+    |
+    | coefficient extraction
+    v
+LWE ciphertext (a,b)
+    |
+    | modulus conversion Q' -> q
+    v
+final FHEW ciphertext
 ```
 
 ---
 
-# 17. `EvalLTPrecomputeSwitch()`
+# 25. FHEW → CKKS
 
-There are overloads for different matrix forms.
+The reverse direction is different.
 
-## 17.1 Matrix A + B form
-
-```text
-EvalLTPrecomputeSwitch(cc, A, B, dim1, L, scale)
-```
-
-Main work:
-
-1. Obtain CKKS cryptographic and element parameters.
-2. Determine how many RNS towers need to be dropped.
-3. Collect the relevant moduli and roots.
-4. Determine the baby-step size.
-5. Concatenate matrix portions as needed.
-6. Extract shifted diagonals.
-7. Rotate/arrange the diagonal coefficients.
-8. Create auxiliary plaintexts using `MakeAuxPlaintext()`.
-
-The important output is a vector of plaintexts representing the matrix diagonals in the form expected by the linear-transform evaluator.
-
-## 17.2 Square A form
+The high-level call is:
 
 ```text
-EvalLTPrecomputeSwitch(cc, A, dim1, L, scale)
+EvalFHEWtoCKKS()
+|
++-- construct A from LWE ciphertexts
+|
++-- construct B from LWE ciphertexts
+|
++-- EvalPartialHomDecryption()
+|   |
+|   +-- EvalLTRectPrecomputeSwitch()
+|   |
+|   +-- EvalLTRectWithPrecomputeSwitch()
+|
+v
+CKKS ciphertext
 ```
 
-This performs the analogous work for a square matrix.
+The important mathematical operation here is the homomorphic evaluation of:
+
+```text
+b - a · s
+```
+
+inside CKKS.
+
+For each LWE ciphertext:
+
+```text
+b = a · s + Δm + e  (mod q)
+```
+
+therefore:
+
+```text
+b - a · s = Δm + e  (mod q)
+```
+
+OpenFHE embeds the LWE secret-key information into the CKKS-side
+computation so that the decryption expression can be evaluated
+homomorphically rather than explicitly decrypting the LWE ciphertext.
 
 ---
 
-# 18. `ExtractShiftedDiagonal()`
-
-**Purpose:** Convert a matrix representation into the diagonal associated with a particular cyclic shift.
-
-This is necessary because the linear-transform evaluator is using a diagonal method rather than directly multiplying a ciphertext by a full matrix.
-
-Conceptually:
+# 26. Full Scheme-Switching Picture
 
 ```text
-Matrix M
-
-m00 m01 m02 ...
-m10 m11 m12 ...
-m20 m21 m22 ...
-...
-
-      ↓ shifted diagonals
-
-D0, D1, D2, ...
+                         Scheme Switching
+                                |
+                +---------------+---------------+
+                |                               |
+                v                               v
+          CKKS -> FHEW                    FHEW -> CKKS
+                |                               |
+                v                               v
+   EvalCKKStoFHEW()                    EvalFHEWtoCKKS()
+                |                               |
+                v                               v
+   Slots -> Coefficients              Build A and B
+                |                               |
+                v                               v
+       Modulus switching               Homomorphic
+                |                      decryption
+                v                               |
+         Key switching                         v
+                |                         CKKS result
+                v
+       RLWE -> LWE extraction
+                |
+                v
+          LWE ciphertext
 ```
-
-Then the transform can be represented as:
-
-
-M x = Σᵢ D_i Rotᵢ(x).
-
 
 ---
 
-# 19. `FHECKKSRNS::MakeAuxPlaintext()`
+# 27. Key Mental Model
 
-**Purpose:** Build the plaintext object used by the RNS CKKS linear-transform machinery from the prepared diagonal coefficient vector.
-
-The precomputation code supplies:
-
-- CKKS crypto context
-- element parameters
-- transformed coefficient vector
-- scaling information
-- towers to drop
-- transform modulus information
-
-The result is stored in precomputed structures such as `m_U0Pre` and later consumed by `EvalLTWithPrecomputeSwitch()`.
-
----
-
-# 20. Reverse Direction: FHEW → CKKS
-
-The reverse switch has a different structure.
-
-```text
-SWITCHCKKSRNS::EvalFHEWtoCKKS()
-│
-├── collect LWE a vectors into matrix A
-├── collect LWE b values into vector B
-│
-├── compute prescale
-│
-└── EvalPartialHomDecryption()
-       │
-       ├── prepare / pad matrix
-       ├── EvalLTRectPrecomputeSwitch()
-       │      ├── prepare rectangular transform
-       │      ├── ExtractShiftedDiagonal()
-       │      └── MakeAuxPlaintext()
-       │
-       └── EvalLTRectWithPrecomputeSwitch()
-              ├── EvalFastRotationPrecompute()
-              ├── EvalFastRotationExt()
-              ├── KeySwitchExt()
-              ├── EvalMultExt()
-              ├── EvalAddExtInPlace()
-              └── KeySwitchDown()
-
-                ↓
-
-        CKKS ciphertext
-```
-
-The important conceptual difference is that FHEW → CKKS is **not** ordinary decryption followed by re-encryption.
-
-Instead, the LWE decryption expression
-
-
-b - \langle a,s \rangle
-
-
-is evaluated homomorphically in CKKS using an encoded representation of the LWE secret key.
-
----
-
-# 21. `EvalFHEWtoCKKS()`
-
-**Role:** Convert a vector of LWE ciphertexts back into a CKKS ciphertext.
-
-The function builds:
-
-```text
-A = matrix of LWE a-vectors
-B = vector of LWE b-values
-```
-
-Then it applies a prescaling factor involving the LWE modulus and the switching scale and invokes:
+When reading:
 
 ```cpp
-EvalPartialHomDecryption(
-    *ccCKKS,
-    A,
-    m_FHEWtoCKKSswk,
-    dim1,
-    prescale,
-    0
-)
+EvalLTWithPrecomputeSwitch(...)
 ```
 
-The result represents the homomorphic evaluation of the LWE decryption expression.
-
-Conceptually:
+think:
 
 ```text
-LWE ciphertexts
-   │
-   ├── A matrix
-   └── B vector
-        │
-        ▼
-CKKS homomorphic computation of B - A·s
-        │
-        ▼
-CKKS ciphertext
+"I have an encrypted CKKS vector.
+
+I have already converted the transformation matrix
+into plaintext diagonal vectors.
+
+Now I am evaluating:
+
+    y = Σk Dk ⊙ Rotk(x)
+
+using CKKS rotations, plaintext multiplication,
+and ciphertext additions.
+
+OpenFHE uses BSGS and extended-RNS machinery
+to perform this efficiently."
 ```
 
----
+When reading:
 
-# 22. `EvalPartialHomDecryption()`
+```cpp
+EvalFHEWtoCKKS(...)
+```
 
-**Purpose:** Evaluate the inner-product part of LWE decryption homomorphically.
-
-The code prepares the matrix for a rectangular linear transform, including padding to a suitable power-of-two size when necessary.
-
-Then:
+think:
 
 ```text
-EvalPartialHomDecryption()
-│
-├── pad matrix if necessary
-│
-├── EvalLTRectPrecomputeSwitch()
-│
-└── EvalLTRectWithPrecomputeSwitch()
+"I have LWE ciphertexts satisfying:
+
+    b = a · s + Δm + e  (mod q)
+
+and I want to evaluate:
+
+    b - a · s
+
+homomorphically in CKKS."
 ```
-
-The mathematical target is the vector of inner products:
-
-
-\langle a_i, s\rangle.
-
-
-This produces the quantity needed to combine with `b_i` and recover the encoded plaintext value under the CKKS computation.
-
----
-
-# 23. `EvalLTRectPrecomputeSwitch()`
-
-This is the rectangular-matrix equivalent of the ordinary linear-transform precomputation.
-
-It prepares the matrix diagonals for a rectangular transform and converts them into plaintext objects suitable for the CKKS evaluator.
-
-The important operations are:
-
-```text
-matrix
-  ↓
-shifted diagonals
-  ↓
-scaling / padding
-  ↓
-auxiliary plaintexts
-  ↓
-precomputed rectangular transform
-```
-
----
-
-# 24. `EvalLTRectWithPrecomputeSwitch()`
-
-This evaluates the rectangular transform using the same general baby-step/giant-step strategy.
-
-Its call pattern is approximately:
-
-```text
-EvalLTRectWithPrecomputeSwitch()
-│
-├── EvalFastRotationPrecompute()
-├── EvalFastRotationExt()
-├── KeySwitchExt()
-├── EvalMultExt()
-├── EvalAddExtInPlace()
-└── KeySwitchDown()
-```
-
-The difference from the square transform is the shape of the matrix and the number of output rows/columns that must be handled.
-
----
-
-# 25. Application Example: `EvalMinSchemeSwitching()`
-
-One of the important callers is the minimum-selection flow.
-
-```text
-EvalMinSchemeSwitching()
-│
-├── EvalSub()
-│     └── compute pairwise CKKS differences
-│
-├── EvalAtIndex()
-│     └── obtain rotated comparison values
-│
-├── EvalCKKStoFHEW()
-│     └── convert comparison values to FHEW/LWE
-│
-├── m_ccLWE->EvalSign()
-│     └── perform sign evaluation in FHEW
-│
-├── EvalFHEWtoCKKS()
-│     └── return comparison / selection result to CKKS
-│
-└── use result to select the minimum-related value
-```
-
-The high-level computation is therefore:
-
-```text
-CKKS values
-   │
-   ▼
-construct differences
-   │
-   ▼
-CKKS → FHEW
-   │
-   ▼
-FHEW EvalSign()
-   │
-   ▼
-FHEW → CKKS
-   │
-   ▼
-selection / minimum computation
-```
-
----
-
-# 26. Where the Functions Live
-
-| Function | Main source / role |
-|---|---|
-| `SWITCHCKKSRNS::EvalCKKStoFHEW` | `ckksrns-schemeswitching.cpp` — top-level CKKS → FHEW switch |
-| `SWITCHCKKSRNS::EvalSlotsToCoeffsSwitch` | `ckksrns-schemeswitching.cpp` — slots → coefficients |
-| `SWITCHCKKSRNS::EvalLTPrecomputeSwitch` | `ckksrns-schemeswitching.cpp` — linear-transform precomputation |
-| `SWITCHCKKSRNS::EvalLTWithPrecomputeSwitch` | `ckksrns-schemeswitching.cpp` — evaluates precomputed transform |
-| `SWITCHCKKSRNS::ExtractLWEpacked` | `ckksrns-schemeswitching.cpp` — extracts A/B coefficient vectors |
-| `SWITCHCKKSRNS::ExtractLWECiphertext` | `ckksrns-schemeswitching.cpp` — constructs an LWE ciphertext |
-| `switchingKeyGenRLWEcc` | `ckksrns-schemeswitching.cpp` — generates CKKS → RLWE(LWE-key) switching key |
-| `SWITCHCKKSRNS::EvalFHEWtoCKKS` | `ckksrns-schemeswitching.cpp` — top-level FHEW → CKKS switch |
-| `EvalPartialHomDecryption` | `ckksrns-schemeswitching.cpp` — homomorphic LWE decryption component |
-| `EvalLTRectPrecomputeSwitch` | `ckksrns-schemeswitching.cpp` — rectangular transform precompute |
-| `EvalLTRectWithPrecomputeSwitch` | `ckksrns-schemeswitching.cpp` — rectangular transform evaluation |
-| `FHECKKSRNS::MakeAuxPlaintext` | `ckksrns-fhe.cpp/.h` — RNS CKKS plaintext preparation |
-| `FHECKKSRNS::EvalMultExt` | `ckksrns-fhe.cpp/.h` — extended CKKS multiplication |
-| `FHECKKSRNS::EvalAddExtInPlace` | `ckksrns-fhe.cpp/.h` — extended CKKS addition |
-| `FHECKKSRNS::KeySwitchDown` | CKKS/RNS implementation — returns from extended representation |
-| `BinFHEContext::EvalSign` | BinFHE/FHEW implementation — sign evaluation |
-| `FHERNS` | `rns-fhe.h` — RNS FHE base/type layer |
-| `SchSwchParams` | `scheme-swch-params.h` — scheme-switching configuration |
-
----
-
-# 27. One-Page Mental Model
-
-When reading `ckksrns-schemeswitching.cpp`, keep this picture in mind:
-
-```text
-                    CKKS WORLD
-                       │
-                       │
-             packed slot values
-                       │
-                       ▼
-          EvalSlotsToCoeffsSwitch
-                       │
-                       ▼
-            diagonal linear transform
-                       │
-                       ▼
-          coefficient-oriented CKKS
-                       │
-              modulus preparation
-                       │
-                       ▼
-                  KeySwitch
-                       │
-                       ▼
-            RLWE under LWE-key form
-                       │
-               coefficient extraction
-                       │
-                       ▼
-                 packed A/B data
-                       │
-                 LWE extraction
-                       │
-                       ▼
-                LWE ciphertexts
-                       │
-                       ▼
-                    FHEW WORLD
-                       │
-                  EvalSign(), etc.
-                       │
-                       ▼
-                LWE ciphertexts
-                       │
-                       ▼
-             homomorphic decryption
-                       │
-                       ▼
-            rectangular CKKS transform
-                       │
-                       ▼
-                 CKKS ciphertext
-                       │
-                       ▼
-                    CKKS WORLD
-```
-
----
-
-# 28. The Most Important Distinctions
-
-## `EvalSlotsToCoeffsSwitch()` vs `EvalLTWithPrecomputeSwitch()`
-
-`EvalSlotsToCoeffsSwitch()` is the **specific scheme-switching transform wrapper**.
-
-`EvalLTWithPrecomputeSwitch()` is the **generic engine that evaluates a precomputed linear transform**.
-
----
-
-## `EvalLTPrecomputeSwitch()` vs `EvalLTWithPrecomputeSwitch()`
-
-```text
-EvalLTPrecomputeSwitch()
-        ↓
-prepare plaintext diagonals
-        ↓
-EvalLTWithPrecomputeSwitch()
-        ↓
-actually evaluate the transform
-```
-
-So one is the **setup/precomputation stage**, while the other is the **runtime evaluation stage**.
-
----
-
-## `KeySwitch()` vs `KeySwitchExt()` / `KeySwitchDown()`
-
-`KeySwitch()` in the top-level switching flow changes the ciphertext's key domain.
-
-The `Ext` and `KeySwitchDown` operations are internal pieces of the RNS CKKS extended evaluation path used during linear-transform computation.
-
-They should not be mentally treated as the same operation even though all involve key switching.
-
----
-
-## `ExtractLWEpacked()` vs `ExtractLWECiphertext()`
-
-```text
-ExtractLWEpacked()
-    = unpack RLWE polynomials into A/B coefficient arrays
-
-ExtractLWECiphertext()
-    = take one slice/index from those arrays and build one LWE ciphertext
-```
-
----
-
-# 29. Minimal Execution Sequence to Memorize
-
-For CKKS → FHEW:
-
-```text
-EvalCKKStoFHEW
-    ↓
-EvalSlotsToCoeffsSwitch
-    ↓
-EvalLTWithPrecomputeSwitch
-    ↓
-ModReduce / ModSwitch
-    ↓
-KeySwitch
-    ↓
-ExtractLWEpacked
-    ↓
-ExtractLWECiphertext
-    ↓
-RoundqQAlter
-    ↓
-FHEW/LWE ciphertexts
-```
-
-For FHEW → CKKS:
-
-```text
-EvalFHEWtoCKKS
-    ↓
-EvalPartialHomDecryption
-    ↓
-EvalLTRectWithPrecomputeSwitch
-    ↓
-CKKS ciphertext
-```
-
-For a min/sign application:
-
-```text
-EvalMinSchemeSwitching
-    ↓
-EvalCKKStoFHEW
-    ↓
-EvalSign
-    ↓
-EvalFHEWtoCKKS
-```
-
----
-
-# 30. Source Notes
-
-The source files relevant to this explanation are:
-
-- `ckksrns-schemeswitching.cpp`
-- `ckksrns-fhe.cpp`
-- `ckksrns-fhe.h`
-- `scheme-swch-params.h`
-- `rns-fhe.h`
-
-The key implementation facts used here include the direct calls visible in the supplied scheme-switching implementation: `EvalSlotsToCoeffsSwitch()`, `ModReduceInternalInPlace()`, `ModSwitch()`, `KeySwitch()`, `ExtractLWEpacked()`, `ExtractLWECiphertext()`, and the conditional `RoundqQAlter()` path, together with the precomputed linear-transform machinery and the reverse `EvalFHEWtoCKKS()` path.
