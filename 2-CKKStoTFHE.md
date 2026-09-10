@@ -374,17 +374,12 @@ The script also prints the same ciphertexts in the TFHE sign convention
 
 ---
 
-## 8. Where to go next
+## 8. QUESTIONS 
 
-1. **FHEW bootstrapping.** Feed these LWE ciphertexts into a blind rotation over
-   `Z_q[x]/(x^{N'}+1)` with a bootstrapping key. This is the point of switching
-   in the first place: evaluating non-polynomial functions (sign, comparison,
-   ReLU, arbitrary LUTs) that CKKS cannot do natively.
-2. **The return path, `EvalFHEWtoCKKS`.** Homomorphically evaluate the LWE
-   decryption `b + ⟨a,s⟩` inside CKKS, then run CoeffsToSlots — the inverse of
-   §6 — to put the values back into slots.
-3. **Batching both halves.** The code here uses only coefficients 0..3 of 8. A
-   real implementation packs the upper half too, doubling throughput.
-4. **Realistic parameters.** `N = 2^12…2^16`, `n = 512…1024`, RNS moduli instead
-   of a single big `Q`, and NTT-based `poly_mul` instead of schoolbook.
+1. **S2C & NTT Question**For the S2C evaluation, we have to compute the Halevi-Shoup homomorphic matrix multiplication. Since this requires many ciphertext-plaintext polynomial multiplications, should I build a dedicated NTT (Number Theoretic Transform) pipeline for this? Or given the structure of the S2C matrix, can we compute it more efficiently using a systolic array architecture to minimize memory reads? 
+2. **Galois Key Streaming** S2C requires many slot rotations, which means we need to pull in massive Galois evaluation keys. Since these won't fit entirely in on-chip SRAM/BRAM, how do you recommend architecting the memory interface to stream these from off-chip DDR without stalling the polynomial multiplication pipelines?
+3. **RNS** CKKS relies heavily on Residue Number System (RNS) limbs to handle the large $Q$. At what exact stage in the hardware pipeline should we break out of RNS and drop down to the single-limb TFHE representation to minimize routing congestion?
+4. How should I handle the CKKS scaling factor in hardware? Should I build a dedicated fixed-point rounding unit right before the modulus switch, or can we just truncate the lower bits to save area?
+5. How deep we have to understand the code or mathematics part?
+6. What will be the broad architecture design, Should we build a direct pipeline where every step—S2C, Mod-Switch, and Blind Rotation—gets its own dedicated hardware? Or should we use a central controller that reuses the same polynomial math units for everything?
 
