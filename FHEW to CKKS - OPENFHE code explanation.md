@@ -2,7 +2,7 @@
 
 ## 1. Scope
 
-This document covers **only the FHEW → CKKS direction** in `ckksrns-schemeswitching.cpp`.
+This document covers ** the FHEW → CKKS direction** in `ckksrns-schemeswitching.cpp`.
 
 The central function is:
 
