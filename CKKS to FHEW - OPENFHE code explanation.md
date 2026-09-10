@@ -1,4 +1,4 @@
-# OpenFHE CKKS ↔ FHEW Scheme Switching
+# OpenFHE CKKS ↔ TFHE Scheme Switching
 
 ## 1. Scope
 
