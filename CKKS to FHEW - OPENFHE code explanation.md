@@ -145,9 +145,9 @@ EvalSlotsToCoeffsSwitch()
 
 The mathematical structure is approximately:
 
-\[
-y = \sum_i D_i \operatorname{Rot}_i(x)
-\]
+
+y = Σᵢ D_i Rotᵢ(x)
+
 
 where:
 
@@ -274,9 +274,9 @@ Here:
 
 Mathematically:
 
-\[
-D_i \cdot \operatorname{Rot}_i(x)
-\]
+
+D_i · Rotᵢ(x)
+
 
 The result is one contribution to the final linear transform.
 
@@ -736,9 +736,9 @@ D0, D1, D2, ...
 
 Then the transform can be represented as:
 
-\[
-M x = \sum_i D_i \operatorname{Rot}_i(x).
-\]
+
+M x = Σᵢ D_i Rotᵢ(x).
+
 
 ---
 
@@ -796,9 +796,9 @@ The important conceptual difference is that FHEW → CKKS is **not** ordinary de
 
 Instead, the LWE decryption expression
 
-\[
+
 b - \langle a,s \rangle
-\]
+
 
 is evaluated homomorphically in CKKS using an encoded representation of the LWE secret key.
 
@@ -867,9 +867,9 @@ EvalPartialHomDecryption()
 
 The mathematical target is the vector of inner products:
 
-\[
+
 \langle a_i, s\rangle.
-\]
+
 
 This produces the quantity needed to combine with `b_i` and recover the encoded plaintext value under the CKKS computation.
 
