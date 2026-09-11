@@ -21,7 +21,7 @@ ROOT = [cmath.exp(2j * math.pi * t / M) for t in range(M)]
 GAL  = [pow(5, j, M) for j in range(NS)]          # [1, 5, 9, 13]
 
 def ckks_encode(zvec, scale, Q):
-    """complex slot vector (length NS) -> integer polynomial mod Q"""
+    complex slot vector (length NS) -> integer polynomial mod Q
     out = []
     for k in range(N):
         acc = 0j
@@ -30,9 +30,6 @@ def ckks_encode(zvec, scale, Q):
         out.append(int(round(scale * 2 * acc.real / N)) % Q)
     return out
 
-Companion document for `ckks_to_tfhe.py` — a from-scratch, dependency-free
-replication of OpenFHE's `EvalCKKStoFHEW` pipeline with toy parameters
-(`N = 8`) so that every intermediate value can be printed and checked by hand.
 
 ---
 
@@ -376,10 +373,10 @@ The script also prints the same ciphertexts in the TFHE sign convention
 
 ## 8. QUESTIONS 
 
-1. **S2C & NTT Question**For the S2C evaluation, we have to compute the homomorphic matrix multiplication. Since this requires many ciphertext-plaintext polynomial multiplications, should I build a dedicated NTT (Number Theoretic Transform) pipeline for this? Or given the structure of the S2C matrix, can we compute it more efficiently using a systolic array architecture to minimize memory reads? 
-2. **Galois Key Streaming** S2C requires many slot rotations, which means we need to pull in massive Galois evaluation keys. Since these won't fit entirely in on-chip SRAM/BRAM, how do you recommend architecting the memory interface to stream these from off-chip DDR without stalling the polynomial multiplication pipelines?
+1. **S2C & NTT Question** For the S2C evaluation, we have to compute the homomorphic matrix multiplication. Since this requires many ciphertext-plaintext polynomial multiplications, should I build a dedicated NTT (Number Theoretic Transform) pipeline for this? Or given the structure of the S2C matrix, can we compute it more efficiently using a systolic array architecture to minimize memory reads? 
+2. What will be the broad architecture design, Should we build a direct pipeline where every step—S2C, Mod-Switch, and Blind Rotation—gets its own dedicated hardware? Or should we use a central controller that reuses the same polynomial math units for everything?
 3. **RNS** CKKS relies heavily on Residue Number System (RNS) limbs to handle the large $Q$. At what exact stage in the hardware pipeline should we break out of RNS and drop down to the single-limb TFHE representation to minimize routing congestion?
 4. How should I handle the CKKS scaling factor in hardware? Should I build a dedicated fixed-point rounding unit right before the modulus switch, or can we just truncate the lower bits to save area?
 5. How deep we have to understand the code or mathematics part?
-6. What will be the broad architecture design, Should we build a direct pipeline where every step—S2C, Mod-Switch, and Blind Rotation—gets its own dedicated hardware? Or should we use a central controller that reuses the same polynomial math units for everything?
+6. **Galois Key Streaming** S2C requires many slot rotations, which means we need to pull in massive Galois evaluation keys. Since these won't fit entirely in on-chip SRAM/BRAM, how do you recommend architecting the memory interface to stream these from off-chip DDR without stalling the polynomial multiplication pipelines?
 
